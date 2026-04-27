@@ -3,8 +3,6 @@
 A lightweight, single-user memory plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) using **Holographic Reduced Representation (HRR)** vectors for compositional reasoning, backed by SQLite with FTS5 full-text search and Reciprocal Rank Fusion (RRF) retrieval.
 
 > **Attribution:** Original plugin by [dusterbloom](https://github.com/dusterbloom) (PR [#2351](https://github.com/NousResearch/hermes-agent/pull/2351)), adapted to the `MemoryProvider` ABC.
->
-> **⚠️ This is the standalone plugin repo (strueman/holographic-memory-plugin). Only push to this repo — do NOT push to NousResearch/hermes-agent.**
 
 ## Features
 
