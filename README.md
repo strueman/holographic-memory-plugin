@@ -104,14 +104,13 @@ Evaluations performed on the LongMemEval oracle subset (500 instances, 10,960 tu
 
 ### LongMemEval 500-instance Results (Entity-Boosted RRF)
 
-| Method | P@3 | R@3 | NDCG@3 |
-|--------|-----|-----|--------|
-| Standard Weighted-sum | 0.185 | 0.267 | 0.240 |
-| RRF (C=60) | 0.248 | 0.359 | 0.366 |
-| **Entity-Boosted RRF** | **0.293** | **0.399** | **0.381** |
+| Method | P@3 | R@3 |
+|--------|-----|-----|
+| Standard Weighted-sum | 0.154 | 0.267 |
+| RRF (C=60) | 0.223 | 0.399 |
+| **Entity-Boosted RRF** | **0.177** | **0.315** |
 
-Entity-boosted RRF outperforms standard RRF by +18.1% P@3 and +11.2% R@3 on the 500-instance subset.
-Entity RRF outperforms weighted-sum by +58.4% P@3 and +49.4% R@3.
+Entity-boosted RRF currently underperforms standard RRF on the 500-instance LME subset: 31 entity wins vs 98 RRF wins, 371 ties. Entity hits: 103/500 queries. This suggests the LME synthetic entities still need refinement — entity boosting shows promise on production data (real entities) but not on synthetic benchmark data.
 
 ## Tests
 
