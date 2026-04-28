@@ -49,7 +49,7 @@ def make_store():
 
 
 def cleanup(store, db_fd, db_path):
-    store._conn.close()
+    store.close()
     os.close(db_fd)
     os.unlink(db_path)
 

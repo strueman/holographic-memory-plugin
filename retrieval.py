@@ -634,13 +634,14 @@ class FactRetriever:
         with rank scoring. Normalizes FTS5 rank to [0, 1] range.
 
         For Chinese queries, uses LIKE fallback since FTS5 unicode61
-        tokenizer filters out Chinese characters by default.
+        tokenizer has poor CJK segmentation (tokenizes Chinese as individual
+        characters), making phrase-based retrieval ineffective.
         """
         import re
         conn = self.store._conn
 
-        # Detect Chinese characters
-        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', query))
+        # Detect Chinese characters (use helper method for consistency)
+        has_chinese = self._has_chinese(query)
         
         if has_chinese:
             # FTS5 unicode61 filters out Chinese chars, use LIKE fallback
@@ -658,11 +659,14 @@ class FactRetriever:
                 keywords = [query]
             
             # Build LIKE query with AND semantics (must match all keywords)
+            # Keep fallback search semantics aligned with FTS by matching
+            # against both content and tags for each keyword.
             params: list = []
             like_clauses = []
             for kw in keywords:
-                like_clauses.append("f.content LIKE ?")
-                params.append(f"%{kw}%")
+                like_clauses.append("(f.content LIKE ? OR f.tags LIKE ?)")
+                like_pattern = f"%{kw}%"
+                params.extend([like_pattern, like_pattern])
             
             where_clauses = [" AND ".join(like_clauses)]
             
@@ -958,26 +962,34 @@ class FactRetriever:
                     cleaned = word.strip(".,;:!?\"'()[]{}#@<>「」『』""''")
                     if cleaned and len(cleaned) > 1:  # filter single chars
                         tokens.add(cleaned)
+                # Also include English tokens for mixed-language text
+                tokens.update(FactRetriever._extract_english_tokens(text))
                 return tokens
             except ImportError:
                 # Fallback: character-level tokenization for Chinese
-                # Split into 2-4 character ngrams for better matching
+                # Preserve Chinese character tokens/bigrams and also retain
+                # ASCII word/number runs so mixed-language text like
+                # "Redis缓存" still produces useful overlap tokens.
                 chars = [c for c in text if c.strip()]
                 tokens = set()
-                # Add individual meaningful characters (skip punctuation)
+                # Add individual meaningful Chinese characters (skip punctuation)
                 for c in chars:
                     if '\u4e00' <= c <= '\u9fff':
                         tokens.add(c)
-                # Add bigrams for phrase matching
+                # Add Chinese bigrams for phrase matching
                 for i in range(len(chars) - 1):
                     if '\u4e00' <= chars[i] <= '\u9fff' and '\u4e00' <= chars[i+1] <= '\u9fff':
                         tokens.add(chars[i] + chars[i+1])
+                # Also retain English/number tokens for mixed-language text.
+                for word in re.findall(r"[A-Za-z0-9]+", text.lower()):
+                    if word:
+                        tokens.add(word)
                 return tokens
         else:
             # English: original whitespace tokenization
             tokens = set()
             for word in text.lower().split():
-                cleaned = word.strip(".,;:!?\"'()[]{}#@<>>")
+                cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
                 if cleaned:
                     tokens.add(cleaned)
             return tokens
