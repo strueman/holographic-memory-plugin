@@ -651,6 +651,28 @@ class FactRetriever:
         return results
 
     @staticmethod
+    def _has_chinese(text: str) -> bool:
+        """Check if text contains Chinese characters."""
+        import re
+        return bool(re.search(r'[\u4e00-\u9fff]', text))
+
+    @staticmethod
+    def _extract_english_tokens(text: str) -> set[str]:
+        """Extract English tokens from mixed-language text."""
+        import re
+        tokens = set()
+        # Split on Chinese/non-Chinese boundaries to isolate English words
+        segments = re.split(r'([\u4e00-\u9fff]+)', text)
+        for seg in segments:
+            if not seg or FactRetriever._has_chinese(seg):
+                continue
+            for word in seg.lower().split():
+                cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
+                if cleaned:
+                    tokens.add(cleaned)
+        return tokens
+
+    @staticmethod
     def _tokenize(text: str) -> set[str]:
         """Tokenization with Chinese support via jieba.
 
