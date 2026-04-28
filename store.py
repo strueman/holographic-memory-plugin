@@ -92,8 +92,15 @@ _RE_AKA          = re.compile(
 
 # Entity extraction patterns (Chinese)
 _RE_CHINESE_QUOTED = re.compile(r'["「」『』]([^"「」『』]+)["「」『』]')
-_RE_CHINESE_NAME   = re.compile(r'[\u4e00-\u9fff]{2,4}(?=说|表示|认为|指出|建议|喜欢|使用)')
-_RE_CHINESE_ENTITY = re.compile(r'[\u4e00-\u9fff]{2,8}(?=的|是|在|用)')
+_RE_CHINESE_NAME   = re.compile(r'[一-鿿]{2,4}(?=说|表示|认为|指出|建议|喜欢|使用)')
+# Use a conservative pattern for Chinese entities: require common entity-like
+# suffixes and avoid the very broad `...的` context, which captures many
+# ordinary noun/adjective phrases rather than named entities.
+_RE_CHINESE_ENTITY = re.compile(
+    r'[一-鿿]{2,8}'
+    r'(?:公司|集团|大学|学院|学校|医院|银行|政府|部门|委员会|中心|平台|系统|项目|品牌|模型|产品|服务|网站|省|市|县)'
+    r'(?=是|在|用)'
+)
 
 
 def _clamp_trust(value: float) -> float:
