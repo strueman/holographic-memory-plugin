@@ -530,14 +530,82 @@ class FactRetriever:
 
         Uses the store's database connection directly for FTS5 MATCH
         with rank scoring. Normalizes FTS5 rank to [0, 1] range.
+
+        For Chinese queries, uses LIKE fallback since FTS5 unicode61
+        tokenizer filters out Chinese characters by default.
         """
+        import re
         conn = self.store._conn
 
-        # Build query - FTS5 rank is negative (lower = better match)
-        # We need to join facts_fts with facts to get all columns
+        # Detect Chinese characters
+        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', query))
+        
+        if has_chinese:
+            # FTS5 unicode61 filters out Chinese chars, use LIKE fallback
+            # Use jieba to extract keywords for better matching
+            keywords = []
+            try:
+                import jieba
+                tokens = list(jieba.cut(query))
+                keywords = [t.strip() for t in tokens if len(t.strip()) > 1 and not t.isspace()]
+            except ImportError:
+                # Fallback: use original query
+                keywords = [query]
+            
+            if not keywords:
+                keywords = [query]
+            
+            # Build LIKE query with AND semantics (must match all keywords)
+            params: list = []
+            like_clauses = []
+            for kw in keywords:
+                like_clauses.append("f.content LIKE ?")
+                params.append(f"%{kw}%")
+            
+            where_clauses = [" AND ".join(like_clauses)]
+            
+            if category:
+                where_clauses.append("f.category = ?")
+                params.append(category)
+            
+            where_clauses.append("f.trust_score >= ?")
+            params.append(min_trust)
+            
+            where_sql = " AND ".join(where_clauses)
+            
+            # Use LIKE-based query for Chinese
+            sql = f"""
+                SELECT f.*, 1.0 as fts_rank
+                FROM facts f
+                WHERE {where_sql}
+                ORDER BY f.trust_score DESC
+                LIMIT ?
+            """
+            params.append(limit)
+            
+            try:
+                rows = conn.execute(sql, params).fetchall()
+            except Exception:
+                return []
+            
+            if not rows:
+                return []
+            
+            # Like results get uniform rank
+            results = []
+            for row in rows:
+                fact = dict(row)
+                fact.pop("fts_rank", None)
+                fact["fts_rank"] = 1.0  # uniform rank for LIKE matches
+                results.append(fact)
+            
+            return results
+        
+        # Non-Chinese: use standard FTS5 query
+        fts_query = query
         params: list = []
         where_clauses = ["facts_fts MATCH ?"]
-        params.append(query)
+        params.append(fts_query)
 
         if category:
             where_clauses.append("f.category = ?")
@@ -584,19 +652,52 @@ class FactRetriever:
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
-        """Simple whitespace tokenization with lowercasing.
+        """Tokenization with Chinese support via jieba.
 
-        Strips common punctuation. No stemming/lemmatization (Phase 1).
+        For Chinese text, uses jieba segmentation.
+        For English text, uses simple whitespace splitting.
+        Strips common punctuation. No stemming/lemmatization.
         """
+        import re
+        
         if not text:
             return set()
-        # Split on whitespace, lowercase, strip punctuation
-        tokens = set()
-        for word in text.lower().split():
-            cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
-            if cleaned:
-                tokens.add(cleaned)
-        return tokens
+        
+        # Detect Chinese characters (CJK Unified Ideographs)
+        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', text))
+        
+        if has_chinese:
+            try:
+                import jieba
+                # Use jieba for Chinese segmentation
+                tokens = set()
+                for word in jieba.cut(text):
+                    cleaned = word.strip(".,;:!?\"'()[]{}#@<>「」『』""''")
+                    if cleaned and len(cleaned) > 1:  # filter single chars
+                        tokens.add(cleaned)
+                return tokens
+            except ImportError:
+                # Fallback: character-level tokenization for Chinese
+                # Split into 2-4 character ngrams for better matching
+                chars = [c for c in text if c.strip()]
+                tokens = set()
+                # Add individual meaningful characters (skip punctuation)
+                for c in chars:
+                    if '\u4e00' <= c <= '\u9fff':
+                        tokens.add(c)
+                # Add bigrams for phrase matching
+                for i in range(len(chars) - 1):
+                    if '\u4e00' <= chars[i] <= '\u9fff' and '\u4e00' <= chars[i+1] <= '\u9fff':
+                        tokens.add(chars[i] + chars[i+1])
+                return tokens
+        else:
+            # English: original whitespace tokenization
+            tokens = set()
+            for word in text.lower().split():
+                cleaned = word.strip(".,;:!?\"'()[]{}#@<>>")
+                if cleaned:
+                    tokens.add(cleaned)
+            return tokens
 
     @staticmethod
     def _jaccard_similarity(set_a: set, set_b: set) -> float:

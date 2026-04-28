@@ -81,7 +81,7 @@ _UNHELPFUL_DELTA = -0.10
 _TRUST_MIN       =  0.0
 _TRUST_MAX       =  1.0
 
-# Entity extraction patterns
+# Entity extraction patterns (English)
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
 _RE_SINGLE_QUOTE = re.compile(r"'([^']+)'")
@@ -89,6 +89,11 @@ _RE_AKA          = re.compile(
     r'(\w+(?:\s+\w+)*)\s+(?:aka|also known as)\s+(\w+(?:\s+\w+)*)',
     re.IGNORECASE,
 )
+
+# Entity extraction patterns (Chinese)
+_RE_CHINESE_QUOTED = re.compile(r'["「」『』]([^"「」『』]+)["「」『』]')
+_RE_CHINESE_NAME   = re.compile(r'[\u4e00-\u9fff]{2,4}(?=说|表示|认为|指出|建议|喜欢|使用)')
+_RE_CHINESE_ENTITY = re.compile(r'[\u4e00-\u9fff]{2,8}(?=的|是|在|用)')
 
 
 def _clamp_trust(value: float) -> float:
@@ -399,6 +404,9 @@ class MemoryStore:
         2. Double-quoted terms             e.g. "Python"
         3. Single-quoted terms             e.g. 'pytest'
         4. AKA patterns                    e.g. "Guido aka BDFL" -> two entities
+        5. Chinese quoted terms            e.g. 「龙哥」
+        6. Chinese name patterns           e.g. 龙哥喜欢 -> 龙哥
+        7. jieba POS tagging (optional)    e.g. 人名/地名/机构名
 
         Returns a deduplicated list preserving first-seen order.
         """
@@ -411,6 +419,7 @@ class MemoryStore:
                 seen.add(stripped.lower())
                 candidates.append(stripped)
 
+        # English patterns
         for m in _RE_CAPITALIZED.finditer(text):
             _add(m.group(1))
 
@@ -423,6 +432,26 @@ class MemoryStore:
         for m in _RE_AKA.finditer(text):
             _add(m.group(1))
             _add(m.group(2))
+
+        # Chinese patterns
+        for m in _RE_CHINESE_QUOTED.finditer(text):
+            _add(m.group(1))
+
+        for m in _RE_CHINESE_NAME.finditer(text):
+            _add(m.group(0))
+
+        for m in _RE_CHINESE_ENTITY.finditer(text):
+            _add(m.group(0))
+
+        # Try jieba POS tagging for better Chinese entity extraction
+        try:
+            import jieba.posseg as pseg
+            for word, flag in pseg.cut(text):
+                # nr=人名, ns=地名, nt=机构名, nz=其他专有名词
+                if flag in ('nr', 'ns', 'nt', 'nz'):
+                    _add(word)
+        except ImportError:
+            pass
 
         return candidates
 
