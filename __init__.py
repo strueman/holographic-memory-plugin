@@ -37,18 +37,21 @@ logger = logging.getLogger(__name__)
 FACT_STORE_SCHEMA = {
     "name": "fact_store",
     "description": (
-        "Deep structured memory with algebraic reasoning. "
+        "Deep structured memory with algebraic reasoning and evidence-gap tracking. "
         "Use alongside the memory tool — memory for always-on context, "
         "fact_store for deep recall and compositional queries.\n\n"
         "ACTIONS (simple → powerful):\n"
         "• add — Store a fact the user would expect you to remember.\n"
-        "• search — Keyword lookup ('editor config', 'deploy process').\n"
+        "• search — Keyword lookup ('editor config', 'deploy process'). Returns an "
+        "evidence_gap field showing which query components were covered or missed. "
+        "If needs_followup is True, refine the search with different terms.\n"
         "• probe — Entity recall: ALL facts about a person/thing.\n"
         "• related — What connects to an entity? Structural adjacency.\n"
         "• reason — Compositional: facts connected to MULTIPLE entities simultaneously.\n"
         "• contradict — Memory hygiene: find facts making conflicting claims.\n"
         "• update/remove/list — CRUD operations.\n\n"
-        "IMPORTANT: Before answering questions about the user, ALWAYS probe or reason first."
+        "IMPORTANT: Before answering questions about the user, ALWAYS probe or reason first. "
+        "Check evidence_gap after search: if uncovered components exist, do a follow-up search."
     ),
     "parameters": {
         "type": "object",

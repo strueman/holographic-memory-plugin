@@ -11,6 +11,7 @@ Ported from KIK memory_agent.py; RRF fusion inspired by Carbonell & Gale
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -52,8 +53,9 @@ class FactRetriever:
         category: str | None = None,
         min_trust: float = 0.3,
         limit: int = 10,
+        evidence_gap: bool = True,
     ) -> list[dict]:
-        """Reciprocal Rank Fusion (RRF) retrieval.
+        """Reciprocal Rank Fusion (RRF) retrieval with evidence-gap analysis.
 
         Combines FTS5, Jaccard, and HRR similarity via rank-level fusion.
         No weight tuning needed — each method contributes via rank position.
@@ -63,8 +65,10 @@ class FactRetriever:
         2. Independent ranking by Jaccard and HRR within candidate set
         3. RRF fusion: score = sum(60 / (rank_m + 60) for m in methods) * trust
         4. Temporal decay (optional)
+        5. Evidence-gap analysis (optional): check query coverage
 
         Returns list of dicts with fact data + 'score' field, sorted by score desc.
+        If evidence_gap is True, the first result includes an 'evidence_gap' dict.
 
         Inspired by Carbonell & Gale (1992), Van Rijsbergen & Shaw (1994).
         """
@@ -150,6 +154,12 @@ class FactRetriever:
             fact.pop("hrr_rank_1based", None)
             fact.pop("jaccard_score", None)
             fact.pop("hrr_score", None)
+
+        # Stage 5: Evidence-gap analysis
+        if evidence_gap and results:
+            gap = self._analyze_evidence_gap(query, results)
+            results[0]["evidence_gap"] = gap
+
         return results
 
     def probe(
@@ -632,3 +642,157 @@ class FactRetriever:
             return math.pow(0.5, age_days / self.half_life)
         except (ValueError, TypeError):
             return 1.0
+
+    # ------------------------------------------------------------------
+    # Evidence-gap analysis (MemR3-inspired)
+    # ------------------------------------------------------------------
+
+    # Terms that carry little semantic weight for coverage checking
+    _STOP_WORDS = {
+        "a", "an", "the", "is", "are", "was", "were", "be", "been",
+        "being", "have", "has", "had", "do", "does", "did", "will",
+        "would", "could", "should", "may", "might", "shall", "can",
+        "need", "dare", "ought", "used", "to", "of", "in", "for",
+        "on", "with", "at", "by", "from", "as", "into", "through",
+        "during", "before", "after", "above", "below", "between",
+        "out", "off", "over", "under", "again", "further", "then",
+        "once", "here", "there", "when", "where", "why", "how",
+        "all", "both", "each", "few", "more", "most", "other",
+        "some", "such", "no", "nor", "not", "only", "own", "same",
+        "so", "than", "too", "very", "just", "because", "but",
+        "and", "or", "if", "while", "about", "what", "which",
+        "that", "this", "these", "those", "it", "its", "i", "me",
+        "my", "we", "our", "you", "your", "he", "him", "his",
+        "she", "her", "they", "them", "their", "also", "any",
+        "much", "many", "get", "got", "like", "one", "two",
+        "first", "new", "use", "used", "using", "make", "made",
+        "way", "like", "well", "even", "still", "now", "back",
+        "up", "down", "out", "go", "going", "come", "take",
+        "see", "know", "think", "say", "said", "goes",
+    }
+
+    # Entity extraction regex (mirrors store._RE_CAPITALIZED)
+    _RE_CAPITALIZED = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+
+    def _extract_query_components(self, query: str) -> dict:
+        """Decompose a query into coverable evidence components.
+
+        Returns a dict with:
+          - entities: list of extracted entity names
+          - content_words: list of significant non-stopword tokens
+          - phrases: list of multi-word capitalized phrases
+        """
+        # Extract entities using the store's method if available
+        if hasattr(self.store, '_extract_entities'):
+            entities = self.store._extract_entities(query)
+        else:
+            entities = []
+
+        tokens = self._tokenize(query)
+        content_words = [t for t in tokens
+                        if t.lower() not in self._STOP_WORDS and len(t) >= 3]
+
+        # Multi-word capitalized phrases
+        phrases = []
+        for m in self._RE_CAPITALIZED.finditer(query):
+            phrase = m.group(1).strip()
+            if len(phrase.split()) >= 2:
+                phrases.append(phrase)
+
+        return {
+            "entities": entities,
+            "content_words": content_words,
+            "phrases": phrases,
+        }
+
+    def _fact_covers_component(self, fact_content: str, component: str) -> bool:
+        """Check if a fact's content covers a query component.
+
+        Uses token-level Jaccard similarity with a threshold of 0.15.
+        For short components (single words), requires exact substring match
+        (case-insensitive) to avoid false positives.
+        """
+        component_tokens = self._tokenize(component)
+        fact_tokens = self._tokenize(fact_content)
+
+        if not component_tokens:
+            return False
+
+        # Single-token components use substring matching
+        if len(component_tokens) == 1:
+            return component.lower() in fact_content.lower()
+
+        jaccard = self._jaccard_similarity(component_tokens, fact_tokens)
+        return jaccard >= 0.15
+
+    def _analyze_evidence_gap(
+        self,
+        query: str,
+        results: list[dict],
+    ) -> dict:
+        """Analyze whether retrieved facts cover the query's key components.
+
+        Returns a dict with:
+          - coverage_ratio: float 0.0-1.0 (fraction of components covered)
+          - covered: list of component strings that were covered
+          - uncovered: list of component strings that were NOT covered
+          - components_total: int total number of components checked
+          - needs_followup: bool True if coverage_ratio < 0.6
+        """
+        components = self._extract_query_components(query)
+
+        # Flatten all components into a single deduplicated list
+        all_components: list[str] = []
+        seen: set[str] = set()
+
+        for item in components["entities"]:
+            key = item.lower()
+            if key not in seen:
+                seen.add(key)
+                all_components.append(item)
+
+        for item in components["phrases"]:
+            key = item.lower()
+            if key not in seen:
+                seen.add(key)
+                all_components.append(item)
+
+        for item in components["content_words"]:
+            key = item.lower()
+            if key not in seen:
+                seen.add(key)
+                all_components.append(item)
+
+        if not all_components:
+            return {
+                "coverage_ratio": 1.0,
+                "covered": [],
+                "uncovered": [],
+                "components_total": 0,
+                "needs_followup": False,
+            }
+
+        # Check each component against all retrieved facts
+        covered: list[str] = []
+        uncovered: list[str] = []
+
+        for component in all_components:
+            is_covered = False
+            for fact in results:
+                if self._fact_covers_component(fact["content"], component):
+                    is_covered = True
+                    break
+            if is_covered:
+                covered.append(component)
+            else:
+                uncovered.append(component)
+
+        coverage_ratio = len(covered) / len(all_components) if all_components else 1.0
+
+        return {
+            "coverage_ratio": round(coverage_ratio, 2),
+            "covered": covered,
+            "uncovered": uncovered,
+            "components_total": len(all_components),
+            "needs_followup": coverage_ratio < 0.6,
+        }
