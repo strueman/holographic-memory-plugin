@@ -37,18 +37,18 @@ cp -r holographic ~/.hermes/hermes-agent/plugins/memory/holographic
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    FactRetriever                             │
+┌────────────────────────────────────────────────────────────┐
+│                    FactRetriever                           │
 │  ┌─────────┐  ┌──────────┐  ┌─────────┐  ┌──────────┐      │
 │  │ FTS5    │  │ Jaccard  │  │ HRR     │  │ Vec KNN  │      │
 │  │ rank    │  │ rank     │  │ rank    │  │ rank     │      │
 │  └────┬────┘  └────┬─────┘  └────┬────┘  └────┬─────┘      │
-│       └────────────┴─────────────┴────────────┘             │
-│                           │                                  │
-│              Reciprocal Rank Fusion (RRF)                    │
-│              sum(1/(rank + C)) / sources  [C=60]             │
-│                           │                                  │
-│                  Trust-weighted score                        │
+│       └────────────┴─────────────┴────────────┘            │
+│                           │                                │
+│              Reciprocal Rank Fusion (RRF)                  │
+│              sum(1/(rank + C)) / sources  [C=60]           │
+│                           │                                │
+│                  Trust-weighted score                      │
 └───────────────────────────┬────────────────────────────────┘
                             │
                ┌────────────┴────────────┐
