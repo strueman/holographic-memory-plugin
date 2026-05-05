@@ -14,6 +14,7 @@ A lightweight, single-user memory plugin for [Hermes Agent](https://github.com/N
 - **Trust scoring** — asymmetric trust adjustment based on helpful/unhelpful feedback
 - **Fact splitting** — recursive sentence-boundary decomposition reduces FTS5 keyword competition
 - **Entity-boosted RRF** — conditional entity rank boost for named-entity queries
+- **Evidence-gap tracker** — algorithmic coverage analysis checks if retrieved facts actually cover the query's key components (inspired by MemR3, arxiv 2512.20237)
 - **Zero external deps** — uses only Python stdlib (sqlite3, math) + optional numpy for HRR algebra
 - **Single-user** — designed for standalone Hermes Agent sessions
 
@@ -98,6 +99,51 @@ Entity patterns added in this branch:
 
 Entity-boosted RRF is **conditional**: only applies when the query contains entities that match stored facts. This prevents noise on natural language queries.
 
+## Evidence-Gap Tracker
+
+Inspired by MemR3's closed-loop retrieval controller (arxiv 2512.20237), the evidence-gap tracker adds a lightweight algorithmic layer on top of `search()` that checks whether retrieved facts actually cover what the query is asking.
+
+### How It Works
+
+Every `search()` call decomposes the query into three component types:
+
+1. **Entities** — extracted via the store's `_extract_entities()` (capitalized phrases, all-caps tokens, mixed alphanumeric)
+2. **Content words** — significant non-stopword tokens >= 3 characters (80+ English stopwords filtered)
+3. **Phrases** — multi-word capitalized phrases from regex
+
+For each component, coverage is checked against all retrieved facts:
+- Single-word components: exact substring match (case-insensitive)
+- Multi-word components: Jaccard similarity >= 0.15
+
+### Return Values
+
+An evidence-gap dict is attached to the first search result:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `coverage_ratio` | float 0.0-1.0 | Fraction of query components covered |
+| `covered` | list[str] | Components that were covered |
+| `uncovered` | list[str] | Components that were NOT covered |
+| `components_total` | int | Total components checked |
+| `needs_followup` | bool | True if coverage_ratio < 0.6 |
+
+When `needs_followup` is True, the LLM is instructed to refine its search query to cover missing components.
+
+### Usage
+
+```python
+# Enabled by default
+results = retriever.search("what about the Debian VM setup?")
+gap = results[0].get("evidence_gap")  # dict with coverage info
+
+# Disable if not needed
+results = retriever.search("query", evidence_gap=False)
+```
+
+### Testing
+
+19 unit tests in `tests/plugins/memory/test_evidence_gap.py` covering entity extraction, content word filtering, coverage checking, edge cases, and JSON serializability.
+
 ## Benchmarks
 
 Evaluations performed on the LongMemEval oracle subset (500 instances, 10,960 turns) using precision, recall, and NDCG at K=3.
@@ -115,13 +161,18 @@ Entity-boosted RRF currently underperforms standard RRF on the 500-instance LME 
 ## Tests
 
 ```bash
+# RRF tests
 python -m pytest tests/plugins/memory/test_holographic_rrf.py -v
+
+# Evidence-gap tracker tests
+python -m pytest tests/plugins/memory/test_evidence_gap.py -v
 ```
 
-20 tests covering RRF math, full integration, numpy-aware HRR, edge cases, and tokenization.
+20 tests for RRF (math, full integration, numpy-aware HRR, edge cases, tokenization).
+19 tests for evidence-gap tracker (entity extraction, content word filtering, coverage checking, edge cases, JSON serializability).
 
 ## License
 
 MIT — see LICENSE file.
 Original plugin code by dusterbloom (PR #2351).
-RRF improvements, entity-boosted RRF, and fact splitting by Axiom (2026).
+RRF improvements, entity-boosted RRF, fact splitting, and evidence-gap tracker by Axiom (2026).
