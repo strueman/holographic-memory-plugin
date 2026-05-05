@@ -81,6 +81,23 @@ _UNHELPFUL_DELTA = -0.10
 _TRUST_MIN       =  0.0
 _TRUST_MAX       =  1.0
 
+# Cached jieba.posseg module for entity extraction
+_JIEBA_POSSEG = None
+_JIEBA_POSSEG_CHECKED = False
+
+
+def _get_jieba_posseg():
+    """Get jieba.posseg module with caching. Returns None if not available."""
+    global _JIEBA_POSSEG, _JIEBA_POSSEG_CHECKED
+    if not _JIEBA_POSSEG_CHECKED:
+        try:
+            import jieba.posseg as pseg
+            _JIEBA_POSSEG = pseg
+        except ImportError:
+            _JIEBA_POSSEG = None
+        _JIEBA_POSSEG_CHECKED = True
+    return _JIEBA_POSSEG
+
 # Entity extraction patterns (English)
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
@@ -92,7 +109,10 @@ _RE_AKA          = re.compile(
 
 # Entity extraction patterns (Chinese)
 _RE_CHINESE_QUOTED = re.compile(r'["「」『』]([^"「」『』]+)["「」『』]')
-_RE_CHINESE_NAME   = re.compile(r'[一-鿿]{2,4}(?=说|表示|认为|指出|建议|喜欢|使用)')
+# Expanded verb set to capture more common Chinese entity patterns
+_RE_CHINESE_NAME   = re.compile(
+    r'[一-鿿]{2,4}(?=说|表示|认为|指出|建议|喜欢|使用|去|来|做|写|看|吃|给|告诉|想|要|能|会|在|有|是)'
+)
 # Use a conservative pattern for Chinese entities: require common entity-like
 # suffixes and avoid the very broad `...的` context, which captures many
 # ordinary noun/adjective phrases rather than named entities.
@@ -451,14 +471,12 @@ class MemoryStore:
             _add(m.group(0))
 
         # Try jieba POS tagging for better Chinese entity extraction
-        try:
-            import jieba.posseg as pseg
+        pseg = _get_jieba_posseg()
+        if pseg:
             for word, flag in pseg.cut(text):
                 # nr=人名, ns=地名, nt=机构名, nz=其他专有名词
                 if flag in ('nr', 'ns', 'nt', 'nz'):
                     _add(word)
-        except ImportError:
-            pass
 
         return candidates
 
@@ -467,18 +485,19 @@ class MemoryStore:
 
         Returns the entity_id.
         """
-        # Exact name match
+        # Exact name match (case-insensitive)
         row = self._conn.execute(
-            "SELECT entity_id FROM entities WHERE name LIKE ?", (name,)
+            "SELECT entity_id FROM entities WHERE LOWER(name) = LOWER(?)", (name,)
         ).fetchone()
         if row is not None:
             return int(row["entity_id"])
 
         # Search aliases — aliases stored as comma-separated; use LIKE with % boundaries
+        # Case-insensitive match using LOWER()
         alias_row = self._conn.execute(
             """
             SELECT entity_id FROM entities
-            WHERE ',' || aliases || ',' LIKE '%,' || ? || ',%'
+            WHERE ',' || LOWER(aliases) || ',' LIKE '%,' || LOWER(?) || ',%'
             """,
             (name,),
         ).fetchone()

@@ -10,7 +10,10 @@ Ported from KIK memory_agent.py; RRF fusion inspired by Carbonell & Gale
 
 from __future__ import annotations
 
+import logging
 import math
+import re
+import sqlite3
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -22,8 +25,35 @@ try:
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
 
+logger = logging.getLogger(__name__)
+
 # RRF constant. Larger = smoother; 60 is the classic default.
 _RRF_C = 60
+
+# Pre-compiled regex for Chinese character detection (hot path optimization)
+# Using Unicode escape for cross-platform consistency
+_RE_CHINESE = re.compile(r'[一-鿿]')
+
+# HRR role binding constants
+_HRR_ROLE_ENTITY = "__hrr_role_entity__"
+_HRR_ROLE_CONTENT = "__hrr_role_content__"
+
+# Cached jieba module to avoid repeated import attempts
+_JIEBA_MODULE = None
+_JIEBA_CHECKED = False
+
+
+def _get_jieba():
+    """Get jieba module with caching. Returns None if not available."""
+    global _JIEBA_MODULE, _JIEBA_CHECKED
+    if not _JIEBA_CHECKED:
+        try:
+            import jieba
+            _JIEBA_MODULE = jieba
+        except ImportError:
+            _JIEBA_MODULE = None
+        _JIEBA_CHECKED = True
+    return _JIEBA_MODULE
 
 
 class FactRetriever:
@@ -143,14 +173,15 @@ class FactRetriever:
         results = scored[:limit]
 
         # Clean up internal ranking fields and strip raw HRR bytes
-        for fact in results:
-            fact.pop("hrr_vector", None)
-            fact.pop("fts_rank_1based", None)
-            fact.pop("jaccard_rank_1based", None)
-            fact.pop("hrr_rank_1based", None)
-            fact.pop("jaccard_score", None)
-            fact.pop("hrr_score", None)
-        return results
+        # Use dict comprehension to avoid mutations
+        _INTERNAL_FIELDS = {
+            "hrr_vector", "fts_rank_1based", "jaccard_rank_1based",
+            "hrr_rank_1based", "jaccard_score", "hrr_score"
+        }
+        return [
+            {k: v for k, v in fact.items() if k not in _INTERNAL_FIELDS}
+            for fact in results
+        ]
 
     def probe(
         self,
@@ -173,7 +204,7 @@ class FactRetriever:
         conn = self.store._conn
 
         # Encode entity as role-bound vector
-        role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
+        role_entity = hrr.encode_atom(_HRR_ROLE_ENTITY, self.hrr_dim)
         entity_vec = hrr.encode_atom(entity.lower(), self.hrr_dim)
         probe_key = hrr.bind(entity_vec, role_entity)
 
@@ -221,7 +252,7 @@ class FactRetriever:
             # Unbind probe key from fact to see if entity is structurally present
             residual = hrr.unbind(fact_vec, probe_key)
             # Compare residual against content signal
-            role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
+            role_content = hrr.encode_atom(_HRR_ROLE_CONTENT, self.hrr_dim)
             content_vec = hrr.bind(hrr.encode_text(fact["content"], self.hrr_dim), role_content)
             sim = hrr.similarity(residual, content_vec)
             fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
@@ -284,8 +315,8 @@ class FactRetriever:
             residual = hrr.unbind(fact_vec, entity_vec)
             # A high-similarity residual to ANY known role vector means this entity
             # plays a structural role in the fact
-            role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
-            role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
+            role_entity = hrr.encode_atom(_HRR_ROLE_ENTITY, self.hrr_dim)
+            role_content = hrr.encode_atom(_HRR_ROLE_CONTENT, self.hrr_dim)
 
             entity_role_sim = hrr.similarity(residual, role_entity)
             content_role_sim = hrr.similarity(residual, role_content)
@@ -321,7 +352,7 @@ class FactRetriever:
             return self.search(query, category=category, limit=limit)
 
         conn = self.store._conn
-        role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
+        role_entity = hrr.encode_atom(_HRR_ROLE_ENTITY, self.hrr_dim)
 
         # For each entity, compute what the bank "remembers" about it
         # by unbinding entity+role from each fact vector
@@ -356,7 +387,7 @@ class FactRetriever:
         # Score each fact by how much EACH entity is structurally present.
         # A fact scores high only if ALL entities have structural presence
         # (AND semantics via min, vs OR which would use mean/max).
-        role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
+        role_content = hrr.encode_atom(_HRR_ROLE_CONTENT, self.hrr_dim)
 
         scored = []
         for row in rows:
@@ -531,31 +562,31 @@ class FactRetriever:
         Uses the store's database connection directly for FTS5 MATCH
         with rank scoring. Normalizes FTS5 rank to [0, 1] range.
 
-        For Chinese queries, uses LIKE fallback since FTS5 unicode61
-        tokenizer has poor CJK segmentation (tokenizes Chinese as individual
-        characters), making phrase-based retrieval ineffective.
+        For Chinese queries (or mixed Chinese+English), routes entirely to
+        LIKE-based search since FTS5 unicode61 tokenizer has poor CJK
+        segmentation (tokenizes Chinese as individual characters), making
+        phrase-based retrieval ineffective.
         """
-        import re
         conn = self.store._conn
 
         # Detect Chinese characters (use helper method for consistency)
         has_chinese = self._has_chinese(query)
-        
+
         if has_chinese:
             # FTS5 unicode61 filters out Chinese chars, use LIKE fallback
             # Use jieba to extract keywords for better matching
             keywords = []
-            try:
-                import jieba
+            jieba = _get_jieba()
+            if jieba:
                 tokens = list(jieba.cut(query))
                 keywords = [t.strip() for t in tokens if len(t.strip()) > 1 and not t.isspace()]
-            except ImportError:
+            else:
                 # Fallback: use original query
                 keywords = [query]
-            
+
             if not keywords:
                 keywords = [query]
-            
+
             # Build LIKE query with AND semantics (must match all keywords)
             # Keep fallback search semantics aligned with FTS by matching
             # against both content and tags for each keyword.
@@ -563,7 +594,9 @@ class FactRetriever:
             like_clauses = []
             for kw in keywords:
                 like_clauses.append("(f.content LIKE ? OR f.tags LIKE ?)")
-                like_pattern = f"%{kw}%"
+                # Escape LIKE special characters to prevent wildcard interpretation
+                escaped_kw = kw.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+                like_pattern = f"%{escaped_kw}%"
                 params.extend([like_pattern, like_pattern])
             
             where_clauses = [" AND ".join(like_clauses)]
@@ -576,33 +609,33 @@ class FactRetriever:
             params.append(min_trust)
             
             where_sql = " AND ".join(where_clauses)
-            
+
             # Use LIKE-based query for Chinese
+            # ESCAPE clause tells SQLite to treat \ as escape character
+            # Note: LIKE with leading wildcard (%keyword%) cannot use indexes
+            # and may be slow on large datasets (>100k facts). Consider adding
+            # a row limit or using FTS5 with trigram tokenizer for production.
             sql = f"""
                 SELECT f.*, 1.0 as fts_rank
                 FROM facts f
                 WHERE {where_sql}
+                ESCAPE '\\'
                 ORDER BY f.trust_score DESC
                 LIMIT ?
             """
             params.append(limit)
-            
+
             try:
                 rows = conn.execute(sql, params).fetchall()
-            except Exception:
+            except (sqlite3.Error, sqlite3.OperationalError) as e:
+                logger.warning(f"LIKE query failed for Chinese text: {e}")
                 return []
             
             if not rows:
                 return []
-            
+
             # Like results get uniform rank
-            results = []
-            for row in rows:
-                fact = dict(row)
-                fact.pop("fts_rank", None)
-                fact["fts_rank"] = 1.0  # uniform rank for LIKE matches
-                results.append(fact)
-            
+            results = [self._build_fact_dict(row, 1.0) for row in rows]
             return results
         
         # Non-Chinese: use standard FTS5 query
@@ -632,8 +665,9 @@ class FactRetriever:
 
         try:
             rows = conn.execute(sql, params).fetchall()
-        except Exception:
+        except (sqlite3.Error, sqlite3.OperationalError) as e:
             # FTS5 MATCH can fail on malformed queries — fall back to empty
+            logger.warning(f"FTS5 query failed: {e}")
             return []
 
         if not rows:
@@ -645,25 +679,29 @@ class FactRetriever:
         max_rank = max(raw_ranks) if raw_ranks else 1.0
         max_rank = max(max_rank, 1e-6)  # avoid div by zero
 
-        results = []
-        for row, raw_rank in zip(rows, raw_ranks):
-            fact = dict(row)
-            fact.pop("fts_rank_raw", None)
-            fact["fts_rank"] = raw_rank / max_rank  # normalize to [0, 1]
-            results.append(fact)
-
+        results = [
+            self._build_fact_dict(row, raw_rank / max_rank)
+            for row, raw_rank in zip(rows, raw_ranks)
+        ]
         return results
+
+    @staticmethod
+    def _build_fact_dict(row, fts_rank: float) -> dict:
+        """Build fact dictionary from database row with normalized FTS rank."""
+        fact = dict(row)
+        fact.pop("fts_rank_raw", None)
+        fact.pop("fts_rank", None)
+        fact["fts_rank"] = fts_rank
+        return fact
 
     @staticmethod
     def _has_chinese(text: str) -> bool:
         """Check if text contains Chinese characters."""
-        import re
-        return bool(re.search(r'[\u4e00-\u9fff]', text))
+        return bool(_RE_CHINESE.search(text))
 
     @staticmethod
     def _extract_english_tokens(text: str) -> set[str]:
         """Extract English tokens from mixed-language text."""
-        import re
         tokens = set()
         # Split on Chinese/non-Chinese boundaries to isolate English words
         segments = re.split(r'([\u4e00-\u9fff]+)', text)
@@ -684,17 +722,15 @@ class FactRetriever:
         For English text, uses simple whitespace splitting.
         Strips common punctuation. No stemming/lemmatization.
         """
-        import re
-        
         if not text:
             return set()
-        
+
         # Detect Chinese characters (CJK Unified Ideographs)
-        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', text))
-        
+        has_chinese = _RE_CHINESE.search(text)
+
         if has_chinese:
-            try:
-                import jieba
+            jieba = _get_jieba()
+            if jieba:
                 # Use jieba for Chinese segmentation
                 tokens = set()
                 for word in jieba.cut(text):
@@ -704,7 +740,7 @@ class FactRetriever:
                 # Also include English tokens for mixed-language text
                 tokens.update(FactRetriever._extract_english_tokens(text))
                 return tokens
-            except ImportError:
+            else:
                 # Fallback: character-level tokenization for Chinese
                 # Preserve Chinese character tokens/bigrams and also retain
                 # ASCII word/number runs so mixed-language text like
