@@ -101,7 +101,7 @@ _RE_AKA          = re.compile(
 
 # Entity extraction patterns (Chinese)
 _RE_CHINESE_QUOTED = re.compile(r'["「」『』]([^"「」『』]+)["「」『』]')
-_RE_CHINESE_NAME   = re.compile(r'[一-鿿]{2,4}(?=说|表示|认为|指出|建议|喜欢|使用)')
+_RE_CHINESE_NAME   = re.compile(r'[一-鿿]{2,4}(?=说|表示|认为|指出|建议|喜欢|使用|去|来|做|写|看|吃|给|告诉|问|回答|想|觉得|知道|发现|决定|告诉|帮助|支持|参加|负责|管理|开发|设计|创建|发布|更新|提交|合并|部署|运行|测试|修复|改进|优化|实现|完成|开始|结束|离开|回来|进入|通过|用)')
 # Use a conservative pattern for Chinese entities: require common entity-like
 # suffixes and avoid the very broad `...的` context, which captures many
 # ordinary noun/adjective phrases rather than named entities.

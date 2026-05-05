@@ -632,86 +632,14 @@ class FactRetriever:
 
         Uses the store's database connection directly for FTS5 MATCH
         with rank scoring. Normalizes FTS5 rank to [0, 1] range.
-
-        For Chinese queries, uses LIKE fallback since FTS5 unicode61
-        tokenizer has poor CJK segmentation (tokenizes Chinese as individual
-        characters), making phrase-based retrieval ineffective.
         """
-        import re
         conn = self.store._conn
 
-        # Detect Chinese characters (use helper method for consistency)
-        has_chinese = self._has_chinese(query)
-        
-        if has_chinese:
-            # FTS5 unicode61 filters out Chinese chars, use LIKE fallback
-            # Use jieba to extract keywords for better matching
-            keywords = []
-            try:
-                import jieba
-                tokens = list(jieba.cut(query))
-                keywords = [t.strip() for t in tokens if len(t.strip()) > 1 and not t.isspace()]
-            except ImportError:
-                # Fallback: use original query
-                keywords = [query]
-            
-            if not keywords:
-                keywords = [query]
-            
-            # Build LIKE query with AND semantics (must match all keywords)
-            # Keep fallback search semantics aligned with FTS by matching
-            # against both content and tags for each keyword.
-            params: list = []
-            like_clauses = []
-            for kw in keywords:
-                like_clauses.append("(f.content LIKE ? OR f.tags LIKE ?)")
-                like_pattern = f"%{kw}%"
-                params.extend([like_pattern, like_pattern])
-            
-            where_clauses = [" AND ".join(like_clauses)]
-            
-            if category:
-                where_clauses.append("f.category = ?")
-                params.append(category)
-            
-            where_clauses.append("f.trust_score >= ?")
-            params.append(min_trust)
-            
-            where_sql = " AND ".join(where_clauses)
-            
-            # Use LIKE-based query for Chinese
-            sql = f"""
-                SELECT f.*, 1.0 as fts_rank
-                FROM facts f
-                WHERE {where_sql}
-                ORDER BY f.trust_score DESC
-                LIMIT ?
-            """
-            params.append(limit)
-            
-            try:
-                rows = conn.execute(sql, params).fetchall()
-            except Exception:
-                return []
-            
-            if not rows:
-                return []
-            
-            # Like results get uniform rank
-            results = []
-            for row in rows:
-                fact = dict(row)
-                fact.pop("fts_rank", None)
-                fact["fts_rank"] = 1.0  # uniform rank for LIKE matches
-                results.append(fact)
-            
-            return results
-        
-        # Non-Chinese: use standard FTS5 query
-        fts_query = query
+        # Build query - FTS5 rank is negative (lower = better match)
+        # We need to join facts_fts with facts to get all columns
         params: list = []
         where_clauses = ["facts_fts MATCH ?"]
-        params.append(fts_query)
+        params.append(query)
 
         if category:
             where_clauses.append("f.category = ?")
@@ -916,83 +844,20 @@ class FactRetriever:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _has_chinese(text: str) -> bool:
-        """Check if text contains Chinese characters."""
-        import re
-        return bool(re.search(r'[\u4e00-\u9fff]', text))
-
-    @staticmethod
-    def _extract_english_tokens(text: str) -> set[str]:
-        """Extract English tokens from mixed-language text."""
-        import re
-        tokens = set()
-        # Split on Chinese/non-Chinese boundaries to isolate English words
-        segments = re.split(r'([\u4e00-\u9fff]+)', text)
-        for seg in segments:
-            if not seg or FactRetriever._has_chinese(seg):
-                continue
-            for word in seg.lower().split():
-                cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
-                if cleaned:
-                    tokens.add(cleaned)
-        return tokens
-
-    @staticmethod
     def _tokenize(text: str) -> set[str]:
-        """Tokenization with Chinese support via jieba.
+        """Simple whitespace tokenization with lowercasing.
 
-        For Chinese text, uses jieba segmentation.
-        For English text, uses simple whitespace splitting.
-        Strips common punctuation. No stemming/lemmatization.
+        Strips common punctuation. No stemming/lemmatization (Phase 1).
         """
-        import re
-        
         if not text:
             return set()
-        
-        # Detect Chinese characters (CJK Unified Ideographs)
-        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', text))
-        
-        if has_chinese:
-            try:
-                import jieba
-                # Use jieba for Chinese segmentation
-                tokens = set()
-                for word in jieba.cut(text):
-                    cleaned = word.strip(".,;:!?\"'()[]{}#@<>「」『』""''")
-                    if cleaned and len(cleaned) > 1:  # filter single chars
-                        tokens.add(cleaned)
-                # Also include English tokens for mixed-language text
-                tokens.update(FactRetriever._extract_english_tokens(text))
-                return tokens
-            except ImportError:
-                # Fallback: character-level tokenization for Chinese
-                # Preserve Chinese character tokens/bigrams and also retain
-                # ASCII word/number runs so mixed-language text like
-                # "Redis缓存" still produces useful overlap tokens.
-                chars = [c for c in text if c.strip()]
-                tokens = set()
-                # Add individual meaningful Chinese characters (skip punctuation)
-                for c in chars:
-                    if '\u4e00' <= c <= '\u9fff':
-                        tokens.add(c)
-                # Add Chinese bigrams for phrase matching
-                for i in range(len(chars) - 1):
-                    if '\u4e00' <= chars[i] <= '\u9fff' and '\u4e00' <= chars[i+1] <= '\u9fff':
-                        tokens.add(chars[i] + chars[i+1])
-                # Also retain English/number tokens for mixed-language text.
-                for word in re.findall(r"[A-Za-z0-9]+", text.lower()):
-                    if word:
-                        tokens.add(word)
-                return tokens
-        else:
-            # English: original whitespace tokenization
-            tokens = set()
-            for word in text.lower().split():
-                cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
-                if cleaned:
-                    tokens.add(cleaned)
-            return tokens
+        # Split on whitespace, lowercase, strip punctuation
+        tokens = set()
+        for word in text.lower().split():
+            cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
+            if cleaned:
+                tokens.add(cleaned)
+        return tokens
 
     @staticmethod
     def _jaccard_similarity(set_a: set, set_b: set) -> float:
