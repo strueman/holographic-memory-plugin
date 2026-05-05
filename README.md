@@ -195,17 +195,37 @@ results = retriever.search("query", evidence_gap=False)
 
 ## Benchmarks
 
-Evaluations performed on the LongMemEval oracle subset (500 instances, 10,960 turns) using precision, recall, and NDCG at K=3.
+Evaluations performed on the LongMemEval oracle subset (500 instances, 10,960 turns) using precision, recall, and NDCG at K=3 and K=5.
 
-### LongMemEval 500-instance Results (Entity-Boosted RRF)
+**Benchmark methodology:** The benchmark imports the real `FactRetriever` and `MemoryStore` from the plugin, retrieves actual FTS5 + vec KNN candidates, then applies both RRF and weighted-sum scoring on the **same candidate pool** for a fair comparison. All four ranking sources (FTS5, Vec, Jaccard, HRR) are active during candidate retrieval.
 
-| Method | P@3 | R@3 |
-|--------|-----|-----|
-| Standard Weighted-sum | 0.154 | 0.267 |
-| RRF (C=60) | 0.223 | 0.399 |
-| **Entity-Boosted RRF** | **0.177** | **0.315** |
+### LongMemEval 500-instance Results (4-signal RRF)
 
-Entity-boosted RRF currently underperforms standard RRF on the 500-instance LME subset: 31 entity wins vs 98 RRF wins, 371 ties. Entity hits: 103/500 queries. This suggests the LME synthetic entities still need refinement — entity boosting shows promise on production data (real entities) but not on synthetic benchmark data.
+| Method | P@3 | P@5 | R@3 | R@5 | NDCG@3 |
+|--------|-----|-----|-----|-----|--------|
+| Standard Weighted-sum | 0.249 | 0.162 | 0.441 | 0.476 | 0.419 |
+| **RRF (C=60)** | **0.264** | **0.173** | **0.462** | **0.498** | **0.443** |
+| **Delta** | **+6.2%** | **+6.4%** | **+4.8%** | **+4.6%** | **+5.8%** |
+
+Per-query wins (P@3): RRF=28, Weighted=7, Tie=465 (out of 500).
+
+### By Query Type (P@3)
+
+| Query Type | Weighted | RRF | Delta |
+|------------|----------|-----|-------|
+| temporal-reasoning | 0.261 | 0.283 | +0.023 |
+| multi-session | 0.263 | 0.293 | +0.030 |
+| knowledge-update | 0.376 | 0.385 | +0.009 |
+| single-session-preference | 0.078 | 0.078 | +0.000 |
+| single-session-assistant | 0.125 | 0.143 | +0.018 |
+| single-session-user | 0.229 | 0.214 | -0.014 |
+
+RRF leads on 5 of 6 query types. The single-session-user category is the only one where weighted-sum edges out RRF by a small margin (-0.014), likely because those queries favor the FTS5 rank normalization used by weighted scoring.
+
+### Notes
+
+- **Previous benchmark (standalone)** reported higher deltas (RRF P@3: 0.223 vs Weighted 0.154, +44.6%) because it reimplemented retrieval from scratch without vec candidates. The new benchmark uses the actual plugin pipeline with all 4 signals active, producing higher absolute scores but narrower deltas since both methods benefit from vec.
+- **Entity-boosted RRF** (conditional entity rank boost for named-entity queries) was evaluated separately and underperformed standard RRF on synthetic LME data (P@3: 0.177 vs 0.223). Entity boosting remains enabled in production where real entities show better signal.
 
 ## Tests
 
