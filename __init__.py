@@ -48,6 +48,8 @@ FACT_STORE_SCHEMA = {
         "If needs_followup is True, refine the search with different terms.\n"
         "• probe — Entity recall: ALL facts about a person/thing.\n"
         "• related — What connects to an entity? Structural adjacency.\n"
+        "• linked — Fact-to-fact structural links (HRR/entity/embedding similarity). "
+        "Returns facts linked to a given fact_id with link type and strength.\n"
         "• reason — Compositional: facts connected to MULTIPLE entities simultaneously.\n"
         "• contradict — Memory hygiene: find facts making conflicting claims.\n"
         "• update/remove/list — CRUD operations.\n\n"
@@ -59,17 +61,19 @@ FACT_STORE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "search", "probe", "related", "reason", "contradict", "update", "remove", "list"],
+                "enum": ["add", "search", "probe", "related", "linked", "reason", "contradict", "update", "remove", "list"],
             },
             "content": {"type": "string", "description": "Fact content (required for 'add')."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
             "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
             "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names for 'reason'."},
-            "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
+            "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'/'linked'."},
             "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
             "tags": {"type": "string", "description": "Comma-separated tags."},
+            "link_type": {"type": "string", "enum": ["hrr_similarity", "entity_overlap", "embedding_similarity"], "description": "Filter links by type (for 'linked')."},
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
             "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
+            "min_strength": {"type": "number", "description": "Minimum link strength for 'linked' (default: 0.0)."},
             "limit": {"type": "integer", "description": "Max results (default: 10)."},
         },
         "required": ["action"],
@@ -294,6 +298,15 @@ class HolographicMemoryProvider(MemoryProvider):
                 results = retriever.related(
                     args["entity"],
                     category=args.get("category"),
+                    limit=int(args.get("limit", 10)),
+                )
+                return json.dumps({"results": results, "count": len(results)})
+
+            elif action == "linked":
+                results = store.get_linked_facts(
+                    int(args["fact_id"]),
+                    link_type=args.get("link_type"),
+                    min_strength=float(args.get("min_strength", 0.0)),
                     limit=int(args.get("limit", 10)),
                 )
                 return json.dumps({"results": results, "count": len(results)})

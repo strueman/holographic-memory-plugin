@@ -82,7 +82,26 @@ CREATE TABLE IF NOT EXISTS memory_banks (
     fact_count INTEGER DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS fact_links (
+    fact_id_a  INTEGER REFERENCES facts(fact_id),
+    fact_id_b  INTEGER REFERENCES facts(fact_id),
+    link_type  TEXT NOT NULL,
+    strength   REAL NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (fact_id_a, fact_id_b, link_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fact_links_a ON fact_links(fact_id_a);
+CREATE INDEX IF NOT EXISTS idx_fact_links_b ON fact_links(fact_id_b);
 """
+
+# Structural linking thresholds
+_HRR_LINK_THRESHOLD    = 0.65  # Normalized HRR sim; raw ~0.3 (above random ~0.0)
+_ENTITY_LINK_THRESHOLD = 0.25  # Jaccard overlap on entity sets
+_EMB_LINK_THRESHOLD    = 0.75  # Cosine similarity for embeddings
+_LINK_COMPARE_LIMIT    = 100   # Max facts to compare against per new fact
+_LINKS_PER_FACT_MAX    = 20    # Max outgoing links per fact
 
 # Trust adjustment constants
 _HELPFUL_DELTA   =  0.05
@@ -217,6 +236,8 @@ class MemoryStore:
             self._compute_hrr_vector(fact_id, content)
             # Compute dense embedding for vector search
             self._compute_embedding(fact_id, content)
+            # Structural linking: compare against recent facts
+            self._create_links_for_fact(fact_id)
             self._rebuild_bank(category)
 
             return fact_id
@@ -378,8 +399,215 @@ class MemoryStore:
 
             return True
 
+    # ------------------------------------------------------------------
+    # Structural linking
+    # ------------------------------------------------------------------
+
+    def _create_links_for_fact(self, fact_id: int) -> None:
+        """Compare a new fact against recent existing facts and create links.
+
+        Three link signals:
+        1. HRR vector similarity (structural/semantic overlap)
+        2. Entity set overlap (shared entities)
+        3. Dense embedding similarity (semantic similarity)
+
+        Only creates links when similarity exceeds configured thresholds.
+        Caps comparisons at _LINK_COMPARE_LIMIT facts and outgoing links
+        at _LINKS_PER_FACT_MAX to avoid O(n) blowup.
+        """
+        with self._lock:
+            # Check current link count for this fact
+            existing = self._conn.execute(
+                "SELECT COUNT(*) FROM fact_links WHERE fact_id_a = ?", (fact_id,)
+            ).fetchone()[0]
+            remaining = _LINKS_PER_FACT_MAX - existing
+            if remaining <= 0:
+                return
+
+            # Get recent facts with vectors (most recent first, capped)
+            rows = self._conn.execute(
+                """
+                SELECT fact_id, content, hrr_vector FROM facts
+                WHERE fact_id != ? AND hrr_vector IS NOT NULL
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (fact_id, _LINK_COMPARE_LIMIT),
+            ).fetchall()
+
+            if not rows:
+                return
+
+            # Get the new fact's HRR vector
+            new_row = self._conn.execute(
+                "SELECT hrr_vector FROM facts WHERE fact_id = ?", (fact_id,)
+            ).fetchone()
+            if not new_row or not new_row["hrr_vector"]:
+                return
+            new_vec = hrr.bytes_to_phases(new_row["hrr_vector"])
+
+            # Get the new fact's entities
+            new_entities = self._get_fact_entities(fact_id)
+
+            # Get the new fact's embedding
+            new_emb = self._get_fact_embedding(fact_id)
+
+            links_to_create: list[tuple[int, int, str, float]] = []
+
+            for row in rows:
+                if remaining <= 0:
+                    break
+
+                other_id = row["fact_id"]
+                other_vec = hrr.bytes_to_phases(row["hrr_vector"])
+
+                # Signal 1: HRR similarity
+                if self._hrr_available and remaining > 0:
+                    sim = hrr.similarity(new_vec, other_vec)
+                    # Normalize from [-1, 1] to [0, 1]
+                    norm_sim = (sim + 1.0) / 2.0
+                    if norm_sim > _HRR_LINK_THRESHOLD:
+                        links_to_create.append(
+                            (fact_id, other_id, "hrr_similarity", round(norm_sim, 4))
+                        )
+                        remaining -= 1
+
+                # Signal 2: Entity overlap (Jaccard)
+                if remaining > 0:
+                    other_entities = self._get_fact_entities(other_id)
+                    if new_entities and other_entities:
+                        union = len(new_entities | other_entities)
+                        if union > 0:
+                            entity_jaccard = len(new_entities & other_entities) / union
+                            if entity_jaccard > _ENTITY_LINK_THRESHOLD:
+                                links_to_create.append(
+                                    (fact_id, other_id, "entity_overlap", round(entity_jaccard, 4))
+                                )
+                                remaining -= 1
+
+                # Signal 3: Embedding similarity
+                if remaining > 0 and new_emb is not None:
+                    other_emb = self._get_fact_embedding(other_id)
+                    if other_emb is not None:
+                        emb_sim = self._cosine_similarity(new_emb, other_emb)
+                        if emb_sim > _EMB_LINK_THRESHOLD:
+                            links_to_create.append(
+                                (fact_id, other_id, "embedding_similarity", round(emb_sim, 4))
+                            )
+                            remaining -= 1
+
+            # Insert links (INSERT OR IGNORE handles duplicates)
+            if links_to_create:
+                self._conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO fact_links (fact_id_a, fact_id_b, link_type, strength)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    links_to_create,
+                )
+                self._conn.commit()
+
+    def _get_fact_entities(self, fact_id: int) -> set[str]:
+        """Get entity names linked to a fact."""
+        rows = self._conn.execute(
+            """
+            SELECT e.name FROM entities e
+            JOIN fact_entities fe ON fe.entity_id = e.entity_id
+            WHERE fe.fact_id = ?
+            """,
+            (fact_id,),
+        ).fetchall()
+        return {row["name"].lower() for row in rows}
+
+    def _get_fact_embedding(self, fact_id: int) -> "bytes | None":
+        """Get the dense embedding for a fact. Returns raw bytes or None."""
+        if not _HAS_SQLITE_VEC:
+            return None
+        try:
+            row = self._conn.execute(
+                "SELECT embedding FROM facts_vec WHERE rowid = ?", (fact_id,)
+            ).fetchone()
+            return row["embedding"] if row else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _cosine_similarity(a: bytes, b: bytes) -> float:
+        """Compute cosine similarity between two byte-encoded float32 vectors."""
+        # Decode bytes to lists of floats (avoid numpy dependency here)
+        import struct
+        fmt = f"<{len(a) // 4}f"
+        vec_a = struct.unpack(fmt, a)
+        vec_b = struct.unpack(fmt, b)
+
+        dot = sum(x * y for x, y in zip(vec_a, vec_b))
+        norm_a = sum(x * x for x in vec_a) ** 0.5
+        norm_b = sum(x * x for x in vec_b) ** 0.5
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    def get_linked_facts(
+        self,
+        fact_id: int,
+        link_type: str | None = None,
+        min_strength: float = 0.0,
+        limit: int = 10,
+    ) -> list[dict]:
+        """Retrieve facts structurally linked to a given fact.
+
+        Returns a list of dicts with fact data + 'links' field containing
+        the link details (link_type, strength).
+
+        Arguments:
+            fact_id: The fact to find links for.
+            link_type: Filter by link type ('hrr_similarity', 'entity_overlap',
+                       'embedding_similarity'). None = all types.
+            min_strength: Minimum link strength to include.
+            limit: Maximum number of linked facts to return.
+        """
+        with self._lock:
+            # Verify fact exists
+            row = self._conn.execute(
+                "SELECT fact_id FROM facts WHERE fact_id = ?", (fact_id,)
+            ).fetchone()
+            if row is None:
+                return []
+
+            # Build query - look for links in both directions (A->B or B->A)
+            where_parts: list[str] = [
+                "fl.strength >= ?",
+            ]
+            params: list = [min_strength]
+
+            if link_type is not None:
+                where_parts.append("fl.link_type = ?")
+                params.append(link_type)
+
+            sql = f"""
+                SELECT DISTINCT f.fact_id, f.content, f.category, f.tags,
+                       f.trust_score, f.retrieval_count, f.helpful_count,
+                       f.created_at, f.updated_at,
+                       fl.link_type, fl.strength
+                FROM fact_links fl
+                JOIN facts f ON (
+                    (fl.fact_id_a = ? AND f.fact_id = fl.fact_id_b) OR
+                    (fl.fact_id_b = ? AND f.fact_id = fl.fact_id_a)
+                )
+                WHERE {" AND ".join(where_parts)}
+                ORDER BY fl.strength DESC
+                LIMIT ?
+            """
+            # Params: fact_id (JOIN a), fact_id (JOIN b), min_strength, [link_type], limit
+            params.insert(0, fact_id)
+            params.insert(1, fact_id)
+            params.append(limit)
+
+            rows = self._conn.execute(sql, params).fetchall()
+            return [self._row_to_dict(r) for r in rows]
+
     def remove_fact(self, fact_id: int) -> bool:
-        """Delete a fact and its entity links. Returns True if the row existed."""
+        """Delete a fact, its entity links, and its structural links. Returns True if the row existed."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT fact_id, category FROM facts WHERE fact_id = ?", (fact_id,)
@@ -389,6 +617,9 @@ class MemoryStore:
 
             self._conn.execute(
                 "DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,)
+            )
+            self._conn.execute(
+                "DELETE FROM fact_links WHERE fact_id_a = ? OR fact_id_b = ?", (fact_id, fact_id)
             )
             self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
             self._conn.commit()
