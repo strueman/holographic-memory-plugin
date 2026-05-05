@@ -621,6 +621,39 @@ class FactRetriever:
 
         return results
 
+    def _prepare_fts5_query(self, query: str) -> str:
+        """Preprocess a natural-language query for FTS5 MATCH.
+
+        FTS5 MATCH uses implicit AND between terms, so long queries
+        like "What is the total cost of the new food bowl" return 0
+        results because no single fact contains all those words.
+
+        This method:
+        1. Extracts multi-word capitalized phrases (kept as phrase matches)
+        2. Strips stop words, keeps content words >= 3 chars
+        3. Joins content words with OR for recall
+        4. Falls back to the original query if processing yields nothing
+        """
+        # Extract capitalized multi-word phrases (e.g. "Samsung Galaxy S22")
+        phrases = []
+        for m in self._RE_CAPITALIZED.finditer(query):
+            phrase = m.group(1).strip()
+            if len(phrase.split()) >= 2:
+                phrases.append(f'"{phrase}"')
+
+        # Content words: strip stop words, keep >= 3 chars
+        tokens = self._tokenize(query)
+        content = [t for t in tokens
+                   if t.lower() not in self._STOP_WORDS and len(t) >= 3]
+
+        # Build FTS5 query: phrases OR content words
+        parts = phrases + content
+        if parts:
+            return " OR ".join(parts)
+
+        # Fallback: return original query if processing yielded nothing
+        return query
+
     def _fts_candidates(
         self,
         query: str,
@@ -635,11 +668,14 @@ class FactRetriever:
         """
         conn = self.store._conn
 
+        # Preprocess query for FTS5: strip stop words, use OR for recall
+        fts5_query = self._prepare_fts5_query(query)
+
         # Build query - FTS5 rank is negative (lower = better match)
         # We need to join facts_fts with facts to get all columns
         params: list = []
         where_clauses = ["facts_fts MATCH ?"]
-        params.append(query)
+        params.append(fts5_query)
 
         if category:
             where_clauses.append("f.category = ?")
