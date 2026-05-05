@@ -1,6 +1,6 @@
 # Holographic Memory Plugin
 
-A lightweight, single-user memory plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) using **Holographic Reduced Representation (HRR)** vectors for compositional reasoning, backed by SQLite with FTS5 full-text search and Reciprocal Rank Fusion (RRF) retrieval.
+A lightweight, single-user memory plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) using **Holographic Reduced Representation (HRR)** vectors for compositional reasoning, backed by SQLite with FTS5 full-text search, sqlite-vec dense vector search, and Reciprocal Rank Fusion (RRF) retrieval.
 
 > **Attribution:** Original plugin by [dusterbloom](https://github.com/dusterbloom) (PR [#2351](https://github.com/NousResearch/hermes-agent/pull/2351)), adapted to the `MemoryProvider` ABC.
 
@@ -15,6 +15,7 @@ A lightweight, single-user memory plugin for [Hermes Agent](https://github.com/N
 - **Fact splitting** — recursive sentence-boundary decomposition reduces FTS5 keyword competition
 - **Entity-boosted RRF** — conditional entity rank boost for named-entity queries
 - **Evidence-gap tracker** — algorithmic coverage analysis checks if retrieved facts actually cover the query's key components (inspired by MemR3, arxiv 2512.20237)
+- **Dense vector search** — sqlite-vec KNN queries on 384-dim ONNX embeddings (all-MiniLM-L6-v2), auto-downloaded on first use
 - **Zero external deps** — uses only Python stdlib (sqlite3, math) + optional numpy for HRR algebra
 - **Single-user** — designed for standalone Hermes Agent sessions
 
@@ -23,6 +24,7 @@ A lightweight, single-user memory plugin for [Hermes Agent](https://github.com/N
 - Python 3.11+
 - SQLite 3.35+ (with FTS5 support — enabled by default on Debian)
 - `numpy` — optional, required for HRR vector operations (probe, reason, related)
+- `sqlite-vec` + `onnxruntime` + `tokenizers` — optional, required for dense vector search (auto-installed via `pip install sqlite-vec onnxruntime tokenizers`)
 
 ## Installation
 
@@ -37,14 +39,14 @@ cp -r holographic ~/.hermes/hermes-agent/plugins/memory/holographic
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    FactRetriever                             │
-│  ┌─────────┐  ┌──────────┐  ┌─────────┐  ┌──────────────┐  │
-│  │ FTS5    │  │ Jaccard  │  │ HRR     │  │ Entity Match │  │
-│  │ rank    │  │ rank     │  │ rank    │  │ boost (cond) │  │
-│  └────┬────┘  └────┬─────┘  └────┬────┘  └──────┬───────┘  │
-│       └────────────┴─────────────┴───────────────┘          │
+│  ┌─────────┐  ┌──────────┐  ┌─────────┐  ┌──────────┐      │
+│  │ FTS5    │  │ Jaccard  │  │ HRR     │  │ Vec KNN  │      │
+│  │ rank    │  │ rank     │  │ rank    │  │ rank     │      │
+│  └────┬────┘  └────┬─────┘  └────┬────┘  └────┬─────┘      │
+│       └────────────┴─────────────┴────────────┘             │
 │                           │                                  │
 │              Reciprocal Rank Fusion (RRF)                    │
-│              C / (rank + C)  [C=60]                          │
+│              sum(1/(rank + C)) / sources  [C=60]             │
 │                           │                                  │
 │                  Trust-weighted score                        │
 └───────────────────────────┬────────────────────────────────┘
@@ -55,6 +57,7 @@ cp -r holographic ~/.hermes/hermes-agent/plugins/memory/holographic
                │  │ SQLite (WAL mode)│   │
                │  │  • facts         │   │
                │  │  • facts_fts     │   │
+               │  │  • facts_vec     │   │
                │  │  • entities      │   │
                │  │  • memory_banks  │   │
                │  └──────────────────┘   │
@@ -63,12 +66,15 @@ cp -r holographic ~/.hermes/hermes-agent/plugins/memory/holographic
 
 ## Retrieval Pipeline
 
-The `FactRetriever.search()` method uses a four-stage pipeline:
+The `FactRetriever.search()` method uses a multi-stage pipeline with four ranking sources fused via RRF:
 
-1. **FTS5 candidate retrieval** — fast keyword search via SQLite FTS5, returns top 3× limit candidates
-2. **Independent ranking** — Jaccard and HRR scores computed within candidate set
-3. **Entity resolution** — query entities extracted via regex patterns; conditional RRF boost applied
-4. **RRF fusion** — scores combined via `60/(rank + 60)`, entity boost applied post-fusion when query contains entities
+1. **FTS5 candidate retrieval** — fast keyword search via SQLite FTS5, returns top 3x limit candidates
+2. **Vec KNN candidate retrieval** — dense vector similarity search via sqlite-vec, returns top 3x limit candidates
+3. **Candidate union** — FTS5 and Vec results merged, deduplicated by fact_id
+4. **Per-candidate ranking** — Jaccard and HRR scores computed for each candidate
+5. **RRF fusion** — all four sources combined via `sum(1/(rank + 60)) / num_sources`
+6. **Trust weighting** — final score multiplied by fact's trust_score
+7. **Evidence-gap analysis** — coverage check on retrieved facts (optional, enabled by default)
 
 ## Memory Types
 
@@ -98,6 +104,49 @@ Entity patterns added in this branch:
 - Fragment filtering: removes single-word fragments from split facts
 
 Entity-boosted RRF is **conditional**: only applies when the query contains entities that match stored facts. This prevents noise on natural language queries.
+
+## Dense Vector Search
+
+Inspired by [vstash](https://arxiv.org/abs/2604.15484) hybrid retrieval, the plugin integrates [sqlite-vec](https://github.com/asg017/sqlite-vec) for dense vector similarity search alongside FTS5 keyword search.
+
+### How It Works
+
+- **Embedding model:** all-MiniLM-L6-v2 (384-dim, ONNX runtime, ~90MB) downloaded on first use and cached in `~/.hermes/holographic_embeddings/`
+- **Storage:** `facts_vec` vec0 virtual table stores float32 embeddings keyed by fact_id
+- **Query:** sqlite-vec KNN finds nearest neighbors to the query embedding
+- **Fusion:** Vec rank is one of four sources in the RRF fusion pipeline (FTS5, Jaccard, HRR, Vec)
+
+### Schema
+
+```sql
+CREATE VIRTUAL TABLE facts_vec USING vec0(
+    embedding float[384]
+);
+```
+
+### Backfilling Existing Facts
+
+If facts were added before vector search was enabled, compute embeddings for them:
+
+```python
+from store import MemoryStore
+store = MemoryStore()
+count = store.backfill_embeddings()  # returns number of facts embedded
+```
+
+### Dependencies
+
+Vector search requires three optional packages (not installed by default):
+
+```bash
+pip install sqlite-vec onnxruntime tokenizers
+```
+
+If unavailable, the pipeline degrades gracefully — Vec rank is simply omitted from the RRF fusion and search continues with FTS5 + Jaccard + HRR only.
+
+### Testing
+
+15 unit tests in `tests/test_sqlite_vec.py` covering vec table creation, embedding storage, KNN queries, RRF fusion, backfill, and graceful degradation.
 
 ## Evidence-Gap Tracker
 
@@ -166,13 +215,17 @@ python -m pytest tests/plugins/memory/test_holographic_rrf.py -v
 
 # Evidence-gap tracker tests
 python -m pytest tests/plugins/memory/test_evidence_gap.py -v
+
+# Dense vector search tests
+python -m pytest tests/test_sqlite_vec.py -v
 ```
 
 20 tests for RRF (math, full integration, numpy-aware HRR, edge cases, tokenization).
 19 tests for evidence-gap tracker (entity extraction, content word filtering, coverage checking, edge cases, JSON serializability).
+15 tests for sqlite-vec integration (vec table creation, embedding storage, KNN queries, RRF fusion, backfill, graceful degradation).
 
 ## License
 
 MIT — see LICENSE file.
 Original plugin code by dusterbloom (PR #2351).
-RRF improvements, entity-boosted RRF, fact splitting, and evidence-gap tracker by Axiom (2026).
+RRF improvements, entity-boosted RRF, fact splitting, evidence-gap tracker, and sqlite-vec dense vector search by Axiom (2026).
