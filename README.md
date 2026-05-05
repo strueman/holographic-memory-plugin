@@ -201,6 +201,8 @@ Evaluations performed on the LongMemEval oracle subset (500 instances, 10,960 tu
 
 ### LongMemEval 500-instance Results (4-signal RRF)
 
+**Metric key:** P@K = Precision@K (fraction of top-K results that are relevant), R@K = Recall@K (fraction of relevant results found in top-K), NDCG@K = Normalized Discounted Cumulative Gain (ranking quality, rewards relevant items appearing higher).
+
 | Method | P@3 | P@5 | R@3 | R@5 | NDCG@3 |
 |--------|-----|-----|-----|-----|--------|
 | Standard Weighted-sum | 0.249 | 0.162 | 0.441 | 0.476 | 0.419 |
