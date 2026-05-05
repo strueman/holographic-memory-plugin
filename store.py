@@ -13,6 +13,15 @@ try:
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
 
+try:
+    import sqlite_vec
+    _HAS_SQLITE_VEC = True
+except ImportError:
+    _HAS_SQLITE_VEC = False
+
+# Embedding config
+EMBEDDING_DIM = 384
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
     fact_id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,11 +142,37 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+
+        # Migrate: create vec0 virtual table for dense vector search (sqlite-vec)
+        self._init_vec0()
+
         self._conn.commit()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def _init_vec0(self) -> None:
+        """Create vec0 virtual table for dense vector search if sqlite-vec is available."""
+        if not _HAS_SQLITE_VEC:
+            return
+        try:
+            self._conn.enable_load_extension(True)
+            sqlite_vec.load(self._conn)
+            # Check if vec0 table already exists
+            tables = [r["name"] for r in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()]
+            if "facts_vec" not in tables:
+                self._conn.execute(f"""
+                    CREATE VIRTUAL TABLE facts_vec USING vec0(
+                        embedding float[{EMBEDDING_DIM}]
+                    )
+                """)
+                self._conn.commit()
+        except Exception:
+            # sqlite-vec unavailable or failed — vector search will be disabled
+            pass
 
     def add_fact(
         self,
@@ -180,9 +215,50 @@ class MemoryStore:
 
             # Compute HRR vector after entity linking
             self._compute_hrr_vector(fact_id, content)
+            # Compute dense embedding for vector search
+            self._compute_embedding(fact_id, content)
             self._rebuild_bank(category)
 
             return fact_id
+
+    def backfill_embeddings(self) -> int:
+        """Compute embeddings for all facts that don't have one yet.
+
+        Returns the number of facts that were backfilled.
+        """
+        with self._lock:
+            try:
+                from . import embedding as emb_mod
+            except ImportError:
+                import embedding as emb_mod  # type: ignore[no-redef]
+
+            if not emb_mod.is_available():
+                return 0
+
+            # Get facts without embeddings
+            rows = self._conn.execute("""
+                SELECT f.fact_id, f.content FROM facts f
+                LEFT JOIN facts_vec fv ON fv.rowid = f.fact_id
+                WHERE fv.rowid IS NULL
+            """).fetchall()
+
+            if not rows:
+                return 0
+
+            count = 0
+            for row in rows:
+                try:
+                    vec = emb_mod.encode(row["content"])
+                    if vec is not None:
+                        self._conn.execute(
+                            "INSERT INTO facts_vec(rowid, embedding) VALUES (?, ?)",
+                            (row["fact_id"], vec.tobytes()),
+                        )
+                        count += 1
+                except Exception:
+                    continue
+            self._conn.commit()
+            return count
 
     def search_facts(
         self,
@@ -291,6 +367,9 @@ class MemoryStore:
             # Recompute HRR vector if content changed
             if content is not None:
                 self._compute_hrr_vector(fact_id, content)
+            # Recompute embedding if content changed
+            if content is not None:
+                self._compute_embedding(fact_id, content)
             # Rebuild bank for relevant category
             cat = category or self._conn.execute(
                 "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)
@@ -488,6 +567,29 @@ class MemoryStore:
             self._conn.execute(
                 "UPDATE facts SET hrr_vector = ? WHERE fact_id = ?",
                 (hrr.phases_to_bytes(vector), fact_id),
+            )
+            self._conn.commit()
+
+    def _compute_embedding(self, fact_id: int, content: str) -> None:
+        """Compute and store dense embedding for a fact. No-op if unavailable."""
+        with self._lock:
+            try:
+                from . import embedding as emb_mod
+            except ImportError:
+                import embedding as emb_mod  # type: ignore[no-redef]
+
+            if not emb_mod.is_available():
+                return
+
+            vec = emb_mod.encode(content)
+            if vec is None:
+                return
+
+            # Store as float32 bytes
+            vec_bytes = vec.tobytes()
+            self._conn.execute(
+                "INSERT OR REPLACE INTO facts_vec(rowid, embedding) VALUES (?, ?)",
+                (fact_id, vec_bytes),
             )
             self._conn.commit()
 

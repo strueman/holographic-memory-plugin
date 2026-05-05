@@ -1,11 +1,7 @@
 """Hybrid keyword/BM25 retrieval for the memory store.
 
-Combines FTS5 full-text search with Jaccard and HRR similarity via
-Reciprocal Rank Fusion (RRF) — a scale-invariant rank aggregation method
-that eliminates weight tuning.
-
-Ported from KIK memory_agent.py; RRF fusion inspired by Carbonell & Gale
-(1992) and Van Rijsbergen & Shaw (1994).
+Ported from KIK memory_agent.py — combines FTS5 full-text search with
+Jaccard similarity reranking and trust-weighted scoring.
 """
 
 from __future__ import annotations
@@ -23,29 +19,32 @@ try:
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
 
-# RRF constant. Larger = smoother; 60 is the classic default.
-_RRF_C = 60
-
 
 class FactRetriever:
-    """Multi-strategy fact retrieval with RRF-based fusion scoring."""
+    """Multi-strategy fact retrieval with trust-weighted scoring."""
 
     def __init__(
         self,
         store: MemoryStore,
         temporal_decay_half_life: int = 0,  # days, 0 = disabled
-        fts_weight: float = 0.4,       # deprecated — ignored
-        jaccard_weight: float = 0.3,   # deprecated — ignored
-        hrr_weight: float = 0.3,       # deprecated — ignored
+        fts_weight: float = 0.4,
+        jaccard_weight: float = 0.3,
+        hrr_weight: float = 0.3,
         hrr_dim: int = 1024,
     ):
         self.store = store
         self.half_life = temporal_decay_half_life
         self.hrr_dim = hrr_dim
 
-        # Weight args are now legacy — RRF handles fusion automatically.
-        # No need to check hrr._HAS_NUMPY; we just skip HRR scoring if absent.
-        del fts_weight, jaccard_weight, hrr_weight  # suppress unused-var warnings
+        # Auto-redistribute weights if numpy unavailable
+        if hrr_weight > 0 and not hrr._HAS_NUMPY:
+            fts_weight = 0.6
+            jaccard_weight = 0.4
+            hrr_weight = 0.0
+
+        self.fts_weight = fts_weight
+        self.jaccard_weight = jaccard_weight
+        self.hrr_weight = hrr_weight
 
     def search(
         self,
@@ -55,105 +54,118 @@ class FactRetriever:
         limit: int = 10,
         evidence_gap: bool = True,
     ) -> list[dict]:
-        """Reciprocal Rank Fusion (RRF) retrieval with evidence-gap analysis.
-
-        Combines FTS5, Jaccard, and HRR similarity via rank-level fusion.
-        No weight tuning needed — each method contributes via rank position.
+        """Hybrid search: FTS5 candidates → Jaccard rerank → trust weighting.
 
         Pipeline:
-        1. FTS5 candidate retrieval (limit*3 for headroom)
-        2. Independent ranking by Jaccard and HRR within candidate set
-        3. RRF fusion: score = sum(60 / (rank_m + 60) for m in methods) * trust
-        4. Temporal decay (optional)
+        1. FTS5 search: Get limit*3 candidates from SQLite full-text search
+        2. Jaccard boost: Token overlap between query and fact content
+        3. Trust weighting: final_score = relevance * trust_score
+        4. Temporal decay (optional): decay = 0.5^(age_days / half_life)
         5. Evidence-gap analysis (optional): check query coverage
 
         Returns list of dicts with fact data + 'score' field, sorted by score desc.
         If evidence_gap is True, the first result includes an 'evidence_gap' dict.
-
-        Inspired by Carbonell & Gale (1992), Van Rijsbergen & Shaw (1994).
         """
+        # RRF constant
+        _RRF_C = 60
+
+        # Stage 1: Get FTS5 candidates (more than limit for reranking headroom)
         candidates = self._fts_candidates(query, category, min_trust, limit * 3)
 
-        if not candidates:
+        # Stage 1b: Get vec candidates
+        vec_candidates = self._vec_candidates(query, category, limit * 3)
+
+        # Stage 2: Union candidates (deduplicate by fact_id)
+        seen_ids: set[int] = set()
+        all_candidates: list[dict] = []
+        for fact in candidates:
+            if fact["fact_id"] not in seen_ids:
+                seen_ids.add(fact["fact_id"])
+                all_candidates.append(fact)
+        for fact in vec_candidates:
+            if fact["fact_id"] not in seen_ids:
+                seen_ids.add(fact["fact_id"])
+                all_candidates.append(fact)
+
+        if not all_candidates:
             return []
 
-        # Assign 1-based FTS5 rank from retrieval order.
-        # _fts_candidates returns results ordered by rank (best first).
-        for i, fact in enumerate(candidates):
-            fact["fts_rank_1based"] = i + 1
+        # Build rank maps: fact_id -> rank for each source
+        fts_rank_map: dict[int, int] = {}
+        for rank, fact in enumerate(candidates, start=1):
+            fts_rank_map[fact["fact_id"]] = rank
 
+        vec_rank_map: dict[int, int] = {}
+        for rank, fact in enumerate(vec_candidates, start=1):
+            vec_rank_map[fact["fact_id"]] = rank
+
+        # Stage 3: Compute per-candidate scores using RRF fusion
         query_tokens = self._tokenize(query)
-        n = len(candidates)
+        scored = []
 
-        # --- Compute Jaccard scores for all candidates ---
-        for fact in candidates:
+        for fact in all_candidates:
             content_tokens = self._tokenize(fact["content"])
             tag_tokens = self._tokenize(fact.get("tags", ""))
             all_tokens = content_tokens | tag_tokens
-            fact["jaccard_score"] = self._jaccard_similarity(query_tokens, all_tokens)
 
-        # Rank candidates by Jaccard (descending score → ascending rank)
-        jaccard_ranked = sorted(
-            candidates, key=lambda f: f["jaccard_score"], reverse=True
-        )
-        for i, fact in enumerate(jaccard_ranked):
-            fact["jaccard_rank_1based"] = i + 1
+            # Jaccard similarity
+            jaccard = self._jaccard_similarity(query_tokens, all_tokens)
 
-        # --- Compute HRR similarity for all candidates ---
-        # HRR requires numpy. Skip if unavailable — FTS5 + Jaccard still work.
-        numpy_available = hasattr(hrr, "_HAS_NUMPY") and hrr._HAS_NUMPY
-        has_vectors = any(f.get("hrr_vector") for f in candidates)
+            # HRR similarity
+            if self.hrr_weight > 0 and fact.get("hrr_vector"):
+                fact_vec = hrr.bytes_to_phases(fact["hrr_vector"])
+                query_vec = hrr.encode_text(query, self.hrr_dim)
+                hrr_sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0
+            else:
+                hrr_sim = 0.5  # neutral
 
-        if numpy_available and has_vectors:
-            query_vec = hrr.encode_text(query, self.hrr_dim)
-            for fact in candidates:
-                if fact.get("hrr_vector"):
-                    fact_vec = hrr.bytes_to_phases(fact["hrr_vector"])
-                    fact["hrr_score"] = hrr.similarity(query_vec, fact_vec)
-                else:
-                    fact["hrr_score"] = 0.0  # no vector → lowest score
+            # RRF fusion: combine ranks from multiple sources
+            # Each source contributes 1/(rank + C) where rank starts at 1
+            rrf_score = 0.0
+            source_count = 0
 
-            # Rank by HRR (descending score → ascending rank)
-            hrr_ranked = sorted(
-                candidates, key=lambda f: f["hrr_score"], reverse=True
-            )
-            for i, fact in enumerate(hrr_ranked):
-                fact["hrr_rank_1based"] = i + 1
+            # FTS5 rank contribution
+            if fact["fact_id"] in fts_rank_map:
+                rrf_score += 1.0 / (fts_rank_map[fact["fact_id"]] + _RRF_C)
+                source_count += 1
 
-        # --- RRF fusion ---
-        c = _RRF_C
-        scored = []
-        for fact in candidates:
-            fts_rank = fact["fts_rank_1based"]
-            j_rank = fact["jaccard_rank_1based"]
-            score = (c / (fts_rank + c)) + (c / (j_rank + c))
+            # Vec rank contribution
+            if fact["fact_id"] in vec_rank_map:
+                rrf_score += 1.0 / (vec_rank_map[fact["fact_id"]] + _RRF_C)
+                source_count += 1
 
-            # Add HRR contribution if vectors are available
-            if numpy_available and has_vectors and "hrr_rank_1based" in fact:
-                score += c / (fact["hrr_rank_1based"] + c)
+            # Jaccard rank contribution (compute rank from similarity)
+            # Higher jaccard = lower rank number
+            jaccard_rank = max(1, int((1.0 - jaccard) * len(all_candidates)) + 1)
+            rrf_score += 1.0 / (jaccard_rank + _RRF_C)
+            source_count += 1
 
-            score *= fact["trust_score"]
+            # HRR rank contribution
+            hrr_rank = max(1, int((1.0 - hrr_sim) * len(all_candidates)) + 1)
+            rrf_score += 1.0 / (hrr_rank + _RRF_C)
+            source_count += 1
+
+            # Normalize by number of sources
+            if source_count > 0:
+                rrf_score /= source_count
+
+            # Trust weighting
+            score = rrf_score * fact["trust_score"]
 
             # Optional temporal decay
             if self.half_life > 0:
-                score *= self._temporal_decay(
-                    fact.get("updated_at") or fact.get("created_at")
-                )
+                score *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
 
             fact["score"] = score
             scored.append(fact)
 
+        # Sort by score descending, return top limit
         scored.sort(key=lambda x: x["score"], reverse=True)
         results = scored[:limit]
-
-        # Clean up internal ranking fields and strip raw HRR bytes
+        # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
-            fact.pop("fts_rank_1based", None)
-            fact.pop("jaccard_rank_1based", None)
-            fact.pop("hrr_rank_1based", None)
-            fact.pop("jaccard_score", None)
-            fact.pop("hrr_score", None)
+            fact.pop("vec_distance", None)
 
         # Stage 5: Evidence-gap analysis
         if evidence_gap and results:
@@ -529,6 +541,86 @@ class FactRetriever:
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
 
+    def _vec_candidates(
+        self,
+        query: str,
+        category: str | None,
+        limit: int,
+    ) -> list[dict]:
+        """Get candidates from dense vector search (sqlite-vec KNN).
+
+        Returns list of fact dicts with 'vec_rank' field.
+        Returns empty list if sqlite-vec or embedding model unavailable.
+        """
+        try:
+            import sqlite_vec
+        except ImportError:
+            return []
+
+        try:
+            from . import embedding as emb_mod
+        except ImportError:
+            try:
+                import embedding as emb_mod  # type: ignore[no-redef]
+            except ImportError:
+                return []
+
+        if not emb_mod.is_available():
+            return []
+
+        # Encode query
+        query_vec = emb_mod.encode(query)
+        if query_vec is None:
+            return []
+
+        conn = self.store._conn
+        try:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+        except Exception:
+            return []
+
+        # Check if facts_vec table exists
+        tables = [r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        if "facts_vec" not in tables:
+            return []
+
+        # Build category filter
+        category_clause = ""
+        params = [query_vec.tobytes(), limit * 3]
+        if category is not None:
+            category_clause = "AND f.category = ?"
+            params.append(category)
+
+        # KNN query joining facts_vec with facts table
+        sql = f"""
+            SELECT f.fact_id, f.content, f.category, f.tags,
+                   f.trust_score, f.retrieval_count, f.helpful_count,
+                   f.created_at, f.updated_at, f.hrr_vector,
+                   fv.distance as vec_distance
+            FROM facts_vec fv
+            JOIN facts f ON f.fact_id = fv.rowid
+            WHERE fv.embedding MATCH ?
+              AND k = ?
+              AND f.trust_score >= 0.3
+              {category_clause}
+            ORDER BY fv.distance
+        """
+
+        rows = conn.execute(sql, params).fetchall()
+        if not rows:
+            return []
+
+        results = []
+        for rank, row in enumerate(rows, start=1):
+            fact = dict(row)
+            fact["vec_rank"] = rank
+            results.append(fact)
+
+        return results
+
     def _fts_candidates(
         self,
         query: str,
@@ -592,59 +684,8 @@ class FactRetriever:
 
         return results
 
-    @staticmethod
-    def _tokenize(text: str) -> set[str]:
-        """Simple whitespace tokenization with lowercasing.
-
-        Strips common punctuation. No stemming/lemmatization (Phase 1).
-        """
-        if not text:
-            return set()
-        # Split on whitespace, lowercase, strip punctuation
-        tokens = set()
-        for word in text.lower().split():
-            cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
-            if cleaned:
-                tokens.add(cleaned)
-        return tokens
-
-    @staticmethod
-    def _jaccard_similarity(set_a: set, set_b: set) -> float:
-        """Jaccard similarity coefficient: |A ∩ B| / |A ∪ B|."""
-        if not set_a or not set_b:
-            return 0.0
-        intersection = len(set_a & set_b)
-        union = len(set_a | set_b)
-        return intersection / union if union > 0 else 0.0
-
-    def _temporal_decay(self, timestamp_str: str | None) -> float:
-        """Exponential decay: 0.5^(age_days / half_life_days).
-
-        Returns 1.0 if decay is disabled or timestamp is missing.
-        """
-        if not self.half_life or not timestamp_str:
-            return 1.0
-
-        try:
-            if isinstance(timestamp_str, str):
-                # Parse ISO format timestamp from SQLite
-                ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-            else:
-                ts = timestamp_str
-
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-
-            age_days = (datetime.now(timezone.utc) - ts).total_seconds() / 86400
-            if age_days < 0:
-                return 1.0
-
-            return math.pow(0.5, age_days / self.half_life)
-        except (ValueError, TypeError):
-            return 1.0
-
     # ------------------------------------------------------------------
-    # Evidence-gap analysis (MemR3-inspired)
+    # Evidence-gap analysis
     # ------------------------------------------------------------------
 
     # Terms that carry little semantic weight for coverage checking
@@ -671,7 +712,7 @@ class FactRetriever:
         "see", "know", "think", "say", "said", "goes",
     }
 
-    # Entity extraction regex (mirrors store._RE_CAPITALIZED)
+    # Entity extraction regex (mirrors store._RE_CAPITALIZED to avoid circular imports)
     _RE_CAPITALIZED = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
 
     def _extract_query_components(self, query: str) -> dict:
@@ -682,7 +723,7 @@ class FactRetriever:
           - content_words: list of significant non-stopword tokens
           - phrases: list of multi-word capitalized phrases
         """
-        # Extract entities using the store's method if available
+        # Extract entities using the store's method if available, else our own
         if hasattr(self.store, '_extract_entities'):
             entities = self.store._extract_entities(query)
         else:
@@ -718,7 +759,8 @@ class FactRetriever:
         if not component_tokens:
             return False
 
-        # Single-token components use substring matching
+        # Single-token components use substring matching to avoid
+        # matching "gpu" against "computer" via shared stopwords
         if len(component_tokens) == 1:
             return component.lower() in fact_content.lower()
 
@@ -796,3 +838,58 @@ class FactRetriever:
             "components_total": len(all_components),
             "needs_followup": coverage_ratio < 0.6,
         }
+
+    # ------------------------------------------------------------------
+    # Utility methods
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        """Simple whitespace tokenization with lowercasing.
+
+        Strips common punctuation. No stemming/lemmatization (Phase 1).
+        """
+        if not text:
+            return set()
+        # Split on whitespace, lowercase, strip punctuation
+        tokens = set()
+        for word in text.lower().split():
+            cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
+            if cleaned:
+                tokens.add(cleaned)
+        return tokens
+
+    @staticmethod
+    def _jaccard_similarity(set_a: set, set_b: set) -> float:
+        """Jaccard similarity coefficient: |A ∩ B| / |A ∪ B|."""
+        if not set_a or not set_b:
+            return 0.0
+        intersection = len(set_a & set_b)
+        union = len(set_a | set_b)
+        return intersection / union if union > 0 else 0.0
+
+    def _temporal_decay(self, timestamp_str: str | None) -> float:
+        """Exponential decay: 0.5^(age_days / half_life_days).
+
+        Returns 1.0 if decay is disabled or timestamp is missing.
+        """
+        if not self.half_life or not timestamp_str:
+            return 1.0
+
+        try:
+            if isinstance(timestamp_str, str):
+                # Parse ISO format timestamp from SQLite
+                ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+            else:
+                ts = timestamp_str
+
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+
+            age_days = (datetime.now(timezone.utc) - ts).total_seconds() / 86400
+            if age_days < 0:
+                return 1.0
+
+            return math.pow(0.5, age_days / self.half_life)
+        except (ValueError, TypeError):
+            return 1.0
