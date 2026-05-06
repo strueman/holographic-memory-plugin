@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
 FACT_STORE_SCHEMA = {
     "name": "fact_store",
     "description": (
-        "Deep structured memory with algebraic reasoning and evidence-gap tracking. "
+        "Deep structured memory with algebraic reasoning, evidence-gap tracking, "
+        "and temporal episode segmentation. "
         "Use alongside the memory tool — memory for always-on context, "
         "fact_store for deep recall and compositional queries.\n\n"
         "ACTIONS (simple → powerful):\n"
@@ -52,6 +53,10 @@ FACT_STORE_SCHEMA = {
         "Returns facts linked to a given fact_id with link type and strength.\n"
         "• reason — Compositional: facts connected to MULTIPLE entities simultaneously.\n"
         "• contradict — Memory hygiene: find facts making conflicting claims.\n"
+        "• episode — Get details of a temporal episode (session cluster).\n"
+        "• list_episodes — Browse episodes ordered by time.\n"
+        "• episode_facts — Get all facts in an episode.\n"
+        "• segment — Run temporal segmentation on unassigned facts.\n"
         "• update/remove/list — CRUD operations.\n\n"
         "IMPORTANT: Before answering questions about the user, ALWAYS probe or reason first. "
         "Check evidence_gap after search: if uncovered components exist, do a follow-up search."
@@ -61,19 +66,26 @@ FACT_STORE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "search", "probe", "related", "linked", "reason", "contradict", "update", "remove", "list"],
+                "enum": [
+                    "add", "search", "probe", "related", "linked", "reason", "contradict",
+                    "update", "remove", "list",
+                    "episode", "list_episodes", "episode_facts", "segment",
+                ],
             },
             "content": {"type": "string", "description": "Fact content (required for 'add')."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
             "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
             "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names for 'reason'."},
             "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'/'linked'."},
+            "episode_id": {"type": "integer", "description": "Episode ID for 'episode'/'episode_facts'/'search'."},
             "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
             "tags": {"type": "string", "description": "Comma-separated tags."},
             "link_type": {"type": "string", "enum": ["hrr_similarity", "entity_overlap", "embedding_similarity"], "description": "Filter links by type (for 'linked')."},
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
             "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
             "min_strength": {"type": "number", "description": "Minimum link strength for 'linked' (default: 0.0)."},
+            "gap_minutes": {"type": "integer", "description": "Episode gap threshold in minutes (default: 60)."},
+            "order": {"type": "string", "enum": ["newest", "oldest"], "description": "Episode sort order."},
             "limit": {"type": "integer", "description": "Max results (default: 10)."},
         },
         "required": ["action"],
@@ -283,6 +295,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     category=args.get("category"),
                     min_trust=float(args.get("min_trust", self._min_trust)),
                     limit=int(args.get("limit", 10)),
+                    episode_id=int(args["episode_id"]) if "episode_id" in args else None,
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -350,6 +363,33 @@ class HolographicMemoryProvider(MemoryProvider):
                     limit=int(args.get("limit", 10)),
                 )
                 return json.dumps({"facts": facts, "count": len(facts)})
+
+            # -- Episode actions --
+
+            elif action == "episode":
+                ep = store.get_episode(int(args["episode_id"]))
+                if ep is None:
+                    return tool_error(f"Episode {args['episode_id']} not found")
+                return json.dumps(ep)
+
+            elif action == "list_episodes":
+                episodes = store.list_episodes(
+                    limit=int(args.get("limit", 50)),
+                    order=args.get("order", "newest"),
+                )
+                return json.dumps({"episodes": episodes, "count": len(episodes)})
+
+            elif action == "episode_facts":
+                facts = store.get_episode_facts(
+                    int(args["episode_id"]),
+                    limit=int(args.get("limit", 50)),
+                )
+                return json.dumps({"facts": facts, "count": len(facts)})
+
+            elif action == "segment":
+                gap = int(args.get("gap_minutes", 60)) if "gap_minutes" in args else None
+                stats = store.segment_episodes(gap_minutes=gap)
+                return json.dumps(stats)
 
             else:
                 return tool_error(f"Unknown action: {action}")
