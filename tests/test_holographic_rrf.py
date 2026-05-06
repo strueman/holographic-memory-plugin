@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # Ensure the plugin can be imported
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 class FakeHrrModule:
@@ -113,19 +113,19 @@ class TestRRFScoreCalculation:
 
     def test_rrf_constant(self):
         """The RRF constant C=60 should be defined."""
-        from plugins.memory.holographic.retrieval import _RRF_C
+        from retrieval import _RRF_C
         assert _RRF_C == 60
 
     def test_top_rank_score(self):
         """A fact ranked #1 contributes 1/(1+C) ≈ 0.0164."""
-        from plugins.memory.holographic.retrieval import _RRF_C
+        from retrieval import _RRF_C
         c = _RRF_C
         top_score = 1.0 / (1 + c)
         assert abs(top_score - 0.0164) < 0.0001
 
     def test_lower_rank_score_decreases(self):
         """Higher rank numbers should yield lower RRF contributions."""
-        from plugins.memory.holographic.retrieval import _RRF_C
+        from retrieval import _RRF_C
         c = _RRF_C
         score_1 = 1.0 / (1 + c)
         score_10 = 1.0 / (10 + c)
@@ -134,7 +134,7 @@ class TestRRFScoreCalculation:
 
     def test_rrf_monotonic(self):
         """RRF score strictly decreases with rank."""
-        from plugins.memory.holographic.retrieval import _RRF_C
+        from retrieval import _RRF_C
         c = _RRF_C
         for rank in range(1, 50):
             assert 1.0 / (rank + c) > 1.0 / (rank + 1 + c)
@@ -172,9 +172,9 @@ class TestRRFSearchIntegration:
             {"holographic.holographic": FakeHrrModule},
             clear=False,
         ):
-            from plugins.memory.holographic.retrieval import FactRetriever
+            from retrieval import FactRetriever
             # Temporarily replace the import
-            import plugins.memory.holographic.retrieval as ret
+            import retrieval as ret
             orig_hrr = ret.hrr
             ret.hrr = FakeHrrModule
             try:
@@ -254,7 +254,7 @@ class TestRRFWithNumpy:
     @pytest.fixture
     def retriever(self, store):
         import numpy as np
-        from plugins.memory.holographic.retrieval import FactRetriever
+        from retrieval import FactRetriever
         yield FactRetriever(store, hrr_dim=128)
 
     def test_hrr_contributes_to_score(self, store, retriever):
@@ -275,9 +275,9 @@ class TestEdgeCases:
     def test_empty_store(self):
         """Search on an empty store returns empty list."""
         store = MockMemoryStore()
-        import plugins.memory.holographic.retrieval as ret
+        import retrieval as ret
         with patch.object(ret, "hrr", FakeHrrModule):
-            from plugins.memory.holographic.retrieval import FactRetriever
+            from retrieval import FactRetriever
             retriever = FactRetriever(store)
         results = retriever.search("anything")
         assert results == []
@@ -286,9 +286,9 @@ class TestEdgeCases:
         """Search with only one fact returns that fact."""
         store = MockMemoryStore()
         store.add_fact("This is the only fact")
-        import plugins.memory.holographic.retrieval as ret
+        import retrieval as ret
         with patch.object(ret, "hrr", FakeHrrModule):
-            from plugins.memory.holographic.retrieval import FactRetriever
+            from retrieval import FactRetriever
             retriever = FactRetriever(store)
         results = retriever.search("this fact")
         assert len(results) == 1
@@ -298,9 +298,9 @@ class TestEdgeCases:
         """Weight parameters are accepted for backward compatibility."""
         store = MockMemoryStore()
         store.add_fact("test fact")
-        import plugins.memory.holographic.retrieval as ret
+        import retrieval as ret
         with patch.object(ret, "hrr", FakeHrrModule):
-            from plugins.memory.holographic.retrieval import FactRetriever
+            from retrieval import FactRetriever
             # Should not raise — weights are accepted but RRF is the primary scoring
             retriever = FactRetriever(
                 store,
@@ -317,9 +317,9 @@ class TestEdgeCases:
         """Temporal decay should reduce scores for older facts."""
         store = MockMemoryStore()
         store.add_fact("Recent fact")
-        import plugins.memory.holographic.retrieval as ret
+        import retrieval as ret
         with patch.object(ret, "hrr", FakeHrrModule):
-            from plugins.memory.holographic.retrieval import FactRetriever
+            from retrieval import FactRetriever
             retriever = FactRetriever(store, temporal_decay_half_life=30)
         results = retriever.search("recent fact")
         assert len(results) == 1
@@ -332,12 +332,12 @@ class TestTokenization:
     """Verify the tokenization helper used by Jaccard."""
 
     def test_tokenizes_lowercase(self):
-        from plugins.memory.holographic.retrieval import FactRetriever
+        from retrieval import FactRetriever
         tokens = FactRetriever._tokenize("Hello WORLD")
         assert tokens == {"hello", "world"}
 
     def test_strips_punctuation(self):
-        from plugins.memory.holographic.retrieval import FactRetriever
+        from retrieval import FactRetriever
         tokens = FactRetriever._tokenize("Hello, world!")
         assert "hello" in tokens
         assert "world" in tokens
@@ -345,6 +345,6 @@ class TestTokenization:
         assert "!" not in tokens
 
     def test_empty_input(self):
-        from plugins.memory.holographic.retrieval import FactRetriever
+        from retrieval import FactRetriever
         assert FactRetriever._tokenize("") == set()
         assert FactRetriever._tokenize(None) == set()
