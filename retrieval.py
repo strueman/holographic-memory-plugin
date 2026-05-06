@@ -19,6 +19,9 @@ try:
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
 
+# RRF constant — exposed for testing
+_RRF_C = 60
+
 
 class FactRetriever:
     """Multi-strategy fact retrieval with trust-weighted scoring."""
@@ -53,6 +56,7 @@ class FactRetriever:
         min_trust: float = 0.3,
         limit: int = 10,
         evidence_gap: bool = True,
+        episode_id: int | None = None,
     ) -> list[dict]:
         """Hybrid search: FTS5 candidates → Jaccard rerank → trust weighting.
 
@@ -65,15 +69,13 @@ class FactRetriever:
 
         Returns list of dicts with fact data + 'score' field, sorted by score desc.
         If evidence_gap is True, the first result includes an 'evidence_gap' dict.
+        If episode_id is provided, results are filtered to that episode.
         """
-        # RRF constant
-        _RRF_C = 60
-
         # Stage 1: Get FTS5 candidates (more than limit for reranking headroom)
-        candidates = self._fts_candidates(query, category, min_trust, limit * 3)
+        candidates = self._fts_candidates(query, category, min_trust, limit * 3, episode_id)
 
         # Stage 1b: Get vec candidates
-        vec_candidates = self._vec_candidates(query, category, limit * 3)
+        vec_candidates = self._vec_candidates(query, category, limit * 3, episode_id)
 
         # Stage 2: Union candidates (deduplicate by fact_id)
         seen_ids: set[int] = set()
@@ -546,6 +548,7 @@ class FactRetriever:
         query: str,
         category: str | None,
         limit: int,
+        episode_id: int | None = None,
     ) -> list[dict]:
         """Get candidates from dense vector search (sqlite-vec KNN).
 
@@ -587,14 +590,19 @@ class FactRetriever:
         if "facts_vec" not in tables:
             return []
 
-        # Build category filter
+        # Build filters
         category_clause = ""
+        episode_clause = ""
         params = [query_vec.tobytes(), limit * 3]
         if category is not None:
             category_clause = "AND f.category = ?"
             params.append(category)
+        if episode_id is not None:
+            episode_clause = "AND ef.episode_id = ?"
+            params.append(episode_id)
 
         # KNN query joining facts_vec with facts table
+        episode_join = "JOIN episode_facts ef ON ef.fact_id = f.fact_id" if episode_id is not None else ""
         sql = f"""
             SELECT f.fact_id, f.content, f.category, f.tags,
                    f.trust_score, f.retrieval_count, f.helpful_count,
@@ -602,10 +610,12 @@ class FactRetriever:
                    fv.distance as vec_distance
             FROM facts_vec fv
             JOIN facts f ON f.fact_id = fv.rowid
+            {episode_join}
             WHERE fv.embedding MATCH ?
               AND k = ?
               AND f.trust_score >= 0.3
               {category_clause}
+              {episode_clause}
             ORDER BY fv.distance
         """
 
@@ -660,6 +670,7 @@ class FactRetriever:
         category: str | None,
         min_trust: float,
         limit: int,
+        episode_id: int | None = None,
     ) -> list[dict]:
         """Get raw FTS5 candidates from the store.
 
@@ -684,12 +695,18 @@ class FactRetriever:
         where_clauses.append("f.trust_score >= ?")
         params.append(min_trust)
 
+        if episode_id is not None:
+            where_clauses.append("ef.episode_id = ?")
+            params.append(episode_id)
+
         where_sql = " AND ".join(where_clauses)
 
+        episode_join = "JOIN episode_facts ef ON ef.fact_id = f.fact_id" if episode_id is not None else ""
         sql = f"""
             SELECT f.*, facts_fts.rank as fts_rank_raw
             FROM facts_fts
             JOIN facts f ON f.fact_id = facts_fts.rowid
+            {episode_join}
             WHERE {where_sql}
             ORDER BY facts_fts.rank
             LIMIT ?
