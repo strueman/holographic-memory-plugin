@@ -141,6 +141,38 @@ _RE_AKA          = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Ingestion sanitiser — strip framework-internal markup from fact content
+# before it hits the database.  Mirrors the regexes in memory_manager.py so
+# a fact can never contain <memory-context> tags or [System note: ...] lines
+# that would later trigger the "pre-wrapped context" warning on prefetch.
+# ---------------------------------------------------------------------------
+
+_RE_FENCE_BLOCK = re.compile(
+    r'<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>',
+    re.IGNORECASE,
+)
+_RE_SYSTEM_NOTE = re.compile(
+    r'\[System note:\s*The following is recalled memory context,\s*'
+    r'NOT new user input\.\s*Treat as (?:informational background data'
+    r'|authoritative reference data[^\]]*)\]\s*',
+    re.IGNORECASE,
+)
+_RE_FENCE_TAG = re.compile(
+    r'</?\s*memory-context\s*>',
+    re.IGNORECASE,
+)
+
+
+def _sanitize_fact_content(text: str) -> str:
+    """Strip framework-internal markup tags from fact content on ingestion."""
+    text = _RE_FENCE_BLOCK.sub('', text)
+    text = _RE_SYSTEM_NOTE.sub('', text)
+    text = _RE_FENCE_TAG.sub('', text)
+    # Clean up any double-blank lines left behind
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
 
 def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
@@ -229,7 +261,7 @@ class MemoryStore:
         the content and links them to the fact.
         """
         with self._lock:
-            content = content.strip()
+            content = _sanitize_fact_content(content)
             if not content:
                 raise ValueError("content must not be empty")
 
@@ -382,7 +414,7 @@ class MemoryStore:
 
             if content is not None:
                 assignments.append("content = ?")
-                params.append(content.strip())
+                params.append(_sanitize_fact_content(content))
             if tags is not None:
                 assignments.append("tags = ?")
                 params.append(tags)
