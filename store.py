@@ -224,6 +224,7 @@ class MemoryStore:
 
     def _init_vec0(self) -> None:
         """Create vec0 virtual table for dense vector search if sqlite-vec is available."""
+        global _HAS_SQLITE_VEC
         if not _HAS_SQLITE_VEC:
             return
         try:
@@ -240,9 +241,14 @@ class MemoryStore:
                     )
                 """)
                 self._conn.commit()
-        except Exception:
-            # sqlite-vec unavailable or failed — vector search will be disabled
-            pass
+        except Exception as e:
+            # sqlite-vec unavailable or failed — disable vector search globally.
+            # This prevents _compute_embedding() from crashing on missing facts_vec table.
+            import logging
+            logging.getLogger(__name__).debug(
+                "sqlite-vec init failed, disabling vector search: %s", e
+            )
+            _HAS_SQLITE_VEC = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -1200,6 +1206,8 @@ class MemoryStore:
 
     def _compute_embedding(self, fact_id: int, content: str) -> None:
         """Compute and store dense embedding for a fact. No-op if unavailable."""
+        if not _HAS_SQLITE_VEC:
+            return
         with self._lock:
             try:
                 from . import embedding as emb_mod
@@ -1213,10 +1221,13 @@ class MemoryStore:
             if vec is None:
                 return
 
-            # Store as float32 bytes
+            # vec0 doesn't support INSERT OR REPLACE — delete existing row first
             vec_bytes = vec.tobytes()
             self._conn.execute(
-                "INSERT OR REPLACE INTO facts_vec(rowid, embedding) VALUES (?, ?)",
+                "DELETE FROM facts_vec WHERE rowid = ?", (fact_id,)
+            )
+            self._conn.execute(
+                "INSERT INTO facts_vec(rowid, embedding) VALUES (?, ?)",
                 (fact_id, vec_bytes),
             )
             self._conn.commit()

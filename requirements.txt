@@ -1,0 +1,10 @@
+# Holographic Memory Plugin — test dependencies
+# Core (stdlib): sqlite3, math, re, json, threading
+# Optional runtime:
+numpy                         # HRR vector operations (probe, reason, related)
+sqlite-vec                    # vec0 virtual table for dense vector KNN search
+onnxruntime                   # CPU inference for embedding model
+tokenizers                    # fast tokenizer for ONNX model
+
+# Test:
+pytest>=7.0

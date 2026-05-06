@@ -22,11 +22,44 @@ import logging
 import re
 from typing import Any, Dict, List
 
-from agent.memory_provider import MemoryProvider
-from tools.registry import tool_error
-from .store import MemoryStore
-from .retrieval import FactRetriever
-from hermes_cli.config import cfg_get
+# Graceful imports — these aren't available in the standalone test environment.
+# When running tests from the plugin repo, the hermes-agent internals don't exist.
+# We provide stubs so the module loads cleanly under pytest.
+try:
+    from agent.memory_provider import MemoryProvider
+except ImportError:
+    class MemoryProvider:  # type: ignore[no-redef]
+        """Stub for standalone testing."""
+        pass
+
+try:
+    from tools.registry import tool_error
+except ImportError:
+    def tool_error(msg: str) -> str:  # type: ignore[no-redef]
+        return f"ToolError: {msg}"
+
+# Relative imports work when loaded as a package (hermes-agent).
+# When pytest imports __init__.py as a standalone module, relative imports fail.
+try:
+    from .store import MemoryStore
+except ImportError:
+    import store  # type: ignore[no-redef]
+
+try:
+    from .retrieval import FactRetriever
+except ImportError:
+    import retrieval  # type: ignore[no-redef]
+
+try:
+    from hermes_cli.config import cfg_get
+except ImportError:
+    def cfg_get(d, *keys, default=None):
+        for k in keys:
+            if isinstance(d, dict):
+                d = d.get(k, default)
+            else:
+                return default
+        return d
 
 logger = logging.getLogger(__name__)
 
