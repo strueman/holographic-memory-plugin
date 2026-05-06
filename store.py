@@ -6,6 +6,7 @@ Single-user Hermes memory store plugin.
 import re
 import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -94,6 +95,24 @@ CREATE TABLE IF NOT EXISTS fact_links (
 
 CREATE INDEX IF NOT EXISTS idx_fact_links_a ON fact_links(fact_id_a);
 CREATE INDEX IF NOT EXISTS idx_fact_links_b ON fact_links(fact_id_b);
+
+CREATE TABLE IF NOT EXISTS episodes (
+    episode_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT NOT NULL,
+    start_time  TIMESTAMP NOT NULL,
+    end_time    TIMESTAMP NOT NULL,
+    fact_count  INTEGER DEFAULT 0,
+    summary     TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS episode_facts (
+    episode_id INTEGER REFERENCES episodes(episode_id),
+    fact_id    INTEGER REFERENCES facts(fact_id),
+    PRIMARY KEY (episode_id, fact_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_episodes_start ON episodes(start_time DESC);
+CREATE INDEX IF NOT EXISTS idx_episode_facts_fact ON episode_facts(fact_id);
 """
 
 # Structural linking thresholds
@@ -108,6 +127,10 @@ _HELPFUL_DELTA   =  0.05
 _UNHELPFUL_DELTA = -0.10
 _TRUST_MIN       =  0.0
 _TRUST_MAX       =  1.0
+
+# Temporal segmentation (episodes)
+_EPISODE_GAP_MINUTES = 60   # gap threshold for episode boundaries
+_EPISODE_MAX_SIZE    = 100  # cap episode size to prevent massive clusters
 
 # Entity extraction patterns
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
@@ -167,10 +190,6 @@ class MemoryStore:
 
         self._conn.commit()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def _init_vec0(self) -> None:
         """Create vec0 virtual table for dense vector search if sqlite-vec is available."""
         if not _HAS_SQLITE_VEC:
@@ -192,6 +211,10 @@ class MemoryStore:
         except Exception:
             # sqlite-vec unavailable or failed — vector search will be disabled
             pass
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def add_fact(
         self,
@@ -239,6 +262,9 @@ class MemoryStore:
             # Structural linking: compare against recent facts
             self._create_links_for_fact(fact_id)
             self._rebuild_bank(category)
+
+            # Auto-segment into episode
+            self._auto_segment_fact(fact_id)
 
             return fact_id
 
@@ -398,6 +424,118 @@ class MemoryStore:
             self._rebuild_bank(cat)
 
             return True
+
+    def remove_fact(self, fact_id: int) -> bool:
+        """Delete a fact, its entity links, structural links, and episode links. Returns True if the row existed."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fact_id, category FROM facts WHERE fact_id = ?", (fact_id,)
+            ).fetchone()
+            if row is None:
+                return False
+
+            self._conn.execute(
+                "DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,)
+            )
+            self._conn.execute(
+                "DELETE FROM fact_links WHERE fact_id_a = ? OR fact_id_b = ?", (fact_id, fact_id)
+            )
+            # Clean up episode links — save episode IDs before deleting
+            ep_rows = self._conn.execute(
+                "SELECT episode_id FROM episode_facts WHERE fact_id = ?", (fact_id,)
+            ).fetchall()
+            episode_ids = [r[0] for r in ep_rows]
+
+            self._conn.execute(
+                "DELETE FROM episode_facts WHERE fact_id = ?", (fact_id,)
+            )
+            self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
+
+            # Update fact_count for affected episodes
+            for eid in episode_ids:
+                self._conn.execute(
+                    """
+                    UPDATE episodes SET fact_count = (
+                        SELECT COUNT(*) FROM episode_facts WHERE episode_id = ?
+                    )
+                    WHERE episode_id = ?
+                    """,
+                    (eid, eid),
+                )
+            self._conn.commit()
+            self._rebuild_bank(row["category"])
+            return True
+
+    def list_facts(
+        self,
+        category: str | None = None,
+        min_trust: float = 0.0,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Browse facts ordered by trust_score descending.
+
+        Optionally filter by category and minimum trust score.
+        """
+        with self._lock:
+            params: list = [min_trust]
+            category_clause = ""
+            if category is not None:
+                category_clause = "AND category = ?"
+                params.append(category)
+            params.append(limit)
+
+            sql = f"""
+                SELECT fact_id, content, category, tags, trust_score,
+                       retrieval_count, helpful_count, created_at, updated_at
+                FROM facts
+                WHERE trust_score >= ?
+                  {category_clause}
+                ORDER BY trust_score DESC
+                LIMIT ?
+            """
+            rows = self._conn.execute(sql, params).fetchall()
+            return [self._row_to_dict(r) for r in rows]
+
+    def record_feedback(self, fact_id: int, helpful: bool) -> dict:
+        """Record user feedback and adjust trust asymmetrically.
+
+        helpful=True  -> trust += 0.05, helpful_count += 1
+        helpful=False -> trust -= 0.10
+
+        Returns a dict with fact_id, old_trust, new_trust, helpful_count.
+        Raises KeyError if fact_id does not exist.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fact_id, trust_score, helpful_count FROM facts WHERE fact_id = ?",
+                (fact_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"fact_id {fact_id} not found")
+
+            old_trust: float = row["trust_score"]
+            delta = _HELPFUL_DELTA if helpful else _UNHELPFUL_DELTA
+            new_trust = _clamp_trust(old_trust + delta)
+
+            helpful_increment = 1 if helpful else 0
+            self._conn.execute(
+                """
+                UPDATE facts
+                SET trust_score    = ?,
+                    helpful_count  = helpful_count + ?,
+                    updated_at     = CURRENT_TIMESTAMP
+                WHERE fact_id = ?
+                """,
+                (new_trust, helpful_increment, fact_id),
+            )
+            self._conn.commit()
+
+            return {
+                "fact_id":      fact_id,
+                "old_trust":    old_trust,
+                "new_trust":    new_trust,
+                "helpful_count": row["helpful_count"] + helpful_increment,
+            }
 
     # ------------------------------------------------------------------
     # Structural linking
@@ -606,96 +744,323 @@ class MemoryStore:
             rows = self._conn.execute(sql, params).fetchall()
             return [self._row_to_dict(r) for r in rows]
 
-    def remove_fact(self, fact_id: int) -> bool:
-        """Delete a fact, its entity links, and its structural links. Returns True if the row existed."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT fact_id, category FROM facts WHERE fact_id = ?", (fact_id,)
-            ).fetchone()
-            if row is None:
-                return False
+    # ------------------------------------------------------------------
+    # Temporal segmentation (episodes)
+    # ------------------------------------------------------------------
 
-            self._conn.execute(
-                "DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,)
-            )
-            self._conn.execute(
-                "DELETE FROM fact_links WHERE fact_id_a = ? OR fact_id_b = ?", (fact_id, fact_id)
-            )
-            self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
-            self._conn.commit()
-            self._rebuild_bank(row["category"])
-            return True
+    def segment_episodes(self, gap_minutes: int | None = None) -> dict:
+        """Segment facts into episodes based on temporal gaps.
 
-    def list_facts(
-        self,
-        category: str | None = None,
-        min_trust: float = 0.0,
-        limit: int = 50,
-    ) -> list[dict]:
-        """Browse facts ordered by trust_score descending.
+        Facts whose created_at timestamps are within `gap_minutes` of each other
+        belong to the same episode. When the gap exceeds the threshold, a new
+        episode starts.
 
-        Optionally filter by category and minimum trust score.
+        Only segments facts that are not yet assigned to an episode.
+        Idempotent — calling twice produces the same result.
+
+        Returns stats: {episodes_created, facts_segmented, gaps_skipped}
         """
         with self._lock:
-            params: list = [min_trust]
-            category_clause = ""
-            if category is not None:
-                category_clause = "AND category = ?"
-                params.append(category)
-            params.append(limit)
+            gap = gap_minutes if gap_minutes is not None else _EPISODE_GAP_MINUTES
+            gap_seconds = gap * 60
 
-            sql = f"""
-                SELECT fact_id, content, category, tags, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at
-                FROM facts
-                WHERE trust_score >= ?
-                  {category_clause}
-                ORDER BY trust_score DESC
-                LIMIT ?
-            """
-            rows = self._conn.execute(sql, params).fetchall()
-            return [self._row_to_dict(r) for r in rows]
-
-    def record_feedback(self, fact_id: int, helpful: bool) -> dict:
-        """Record user feedback and adjust trust asymmetrically.
-
-        helpful=True  -> trust += 0.05, helpful_count += 1
-        helpful=False -> trust -= 0.10
-
-        Returns a dict with fact_id, old_trust, new_trust, helpful_count.
-        Raises KeyError if fact_id does not exist.
-        """
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT fact_id, trust_score, helpful_count FROM facts WHERE fact_id = ?",
-                (fact_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"fact_id {fact_id} not found")
-
-            old_trust: float = row["trust_score"]
-            delta = _HELPFUL_DELTA if helpful else _UNHELPFUL_DELTA
-            new_trust = _clamp_trust(old_trust + delta)
-
-            helpful_increment = 1 if helpful else 0
-            self._conn.execute(
+            # Get unassigned facts ordered by created_at
+            unassigned = self._conn.execute(
                 """
-                UPDATE facts
-                SET trust_score    = ?,
-                    helpful_count  = helpful_count + ?,
-                    updated_at     = CURRENT_TIMESTAMP
-                WHERE fact_id = ?
-                """,
-                (new_trust, helpful_increment, fact_id),
-            )
-            self._conn.commit()
+                SELECT f.fact_id, f.created_at
+                FROM facts f
+                WHERE f.fact_id NOT IN (SELECT fact_id FROM episode_facts)
+                ORDER BY f.created_at
+                """
+            ).fetchall()
+
+            if not unassigned:
+                return {"episodes_created": 0, "facts_segmented": 0, "gaps_skipped": 0}
+
+            episodes_created = 0
+            gaps_skipped = 0
+
+            current_episode_id = None
+            current_facts: list[tuple[int, str]] = []
+            current_end: str | None = None
+
+            def _flush_episode() -> None:
+                nonlocal current_episode_id, episodes_created, current_facts
+                if not current_facts:
+                    return
+                # Create episode
+                title = self._generate_episode_title(
+                    [fid for fid, _ in current_facts]
+                )
+                summary = self._generate_episode_summary(
+                    [fid for fid, _ in current_facts]
+                )
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO episodes (title, start_time, end_time, fact_count, summary)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (title, current_facts[0][1], current_end, len(current_facts), summary),
+                )
+                current_episode_id = cur.lastrowid  # type: ignore[assignment]
+                episodes_created += 1
+
+                # Link facts to episode
+                for fid, _ in current_facts:
+                    self._conn.execute(
+                        "INSERT INTO episode_facts (episode_id, fact_id) VALUES (?, ?)",
+                        (current_episode_id, fid),
+                    )
+                self._conn.commit()
+                current_facts = []
+
+            for row in unassigned:
+                fid, ts = row[0], row[1]
+
+                if not current_facts:
+                    # First fact starts a new episode
+                    current_facts.append((fid, ts))
+                    current_end = ts
+                    continue
+
+                # Check gap from last fact in current episode
+                try:
+                    last_ts = datetime.fromisoformat(current_end.replace("Z", "+00:00"))  # type: ignore[union-attr]
+                    this_ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    gap_sec = abs((this_ts - last_ts).total_seconds())
+                except (ValueError, TypeError):
+                    gap_sec = gap_seconds  # on parse error, start new episode
+
+                if gap_sec > gap_seconds or len(current_facts) >= _EPISODE_MAX_SIZE:
+                    # Gap too large or episode full — flush and start new
+                    _flush_episode()
+                    if gap_sec > gap_seconds:
+                        gaps_skipped += 1
+                    current_facts.append((fid, ts))
+                    current_end = ts
+                else:
+                    # Same episode
+                    current_facts.append((fid, ts))
+                    current_end = ts
+
+            # Flush remaining
+            _flush_episode()
 
             return {
-                "fact_id":      fact_id,
-                "old_trust":    old_trust,
-                "new_trust":    new_trust,
-                "helpful_count": row["helpful_count"] + helpful_increment,
+                "episodes_created": episodes_created,
+                "facts_segmented": self._conn.execute(
+                    "SELECT COUNT(DISTINCT fact_id) FROM episode_facts"
+                ).fetchone()[0],
+                "gaps_skipped": gaps_skipped,
             }
+
+    def _auto_segment_fact(self, fact_id: int) -> None:
+        """Assign a newly inserted fact to an existing episode or create one.
+
+        Called from add_fact() after the fact is inserted.
+        Checks if the fact falls within gap_minutes of the most recent episode's
+        end_time. If so, appends to that episode. Otherwise creates a new one.
+        """
+        # Get the most recent episode
+        latest = self._conn.execute(
+            """
+            SELECT episode_id, end_time
+            FROM episodes
+            ORDER BY end_time DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+        fact_row = self._conn.execute(
+            "SELECT created_at FROM facts WHERE fact_id = ?", (fact_id,)
+        ).fetchone()
+        if not fact_row:
+            return
+        fact_ts = fact_row[0]
+
+        try:
+            fact_dt = datetime.fromisoformat(str(fact_ts).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return
+
+        if latest:
+            try:
+                end_dt = datetime.fromisoformat(str(latest[1]).replace("Z", "+00:00"))
+                gap_sec = abs((fact_dt - end_dt).total_seconds())
+            except (ValueError, TypeError):
+                gap_sec = _EPISODE_GAP_MINUTES * 60 + 1
+
+            if gap_sec <= _EPISODE_GAP_MINUTES * 60:
+                # Append to existing episode
+                self._conn.execute(
+                    "INSERT INTO episode_facts (episode_id, fact_id) VALUES (?, ?)",
+                    (latest[0], fact_id),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE episodes
+                    SET end_time = ?, fact_count = fact_count + 1
+                    WHERE episode_id = ?
+                    """,
+                    (fact_ts, latest[0]),
+                )
+                # Refresh title + summary for updated episode
+                title = self._generate_episode_title([fact_id])
+                self._conn.execute(
+                    "UPDATE episodes SET title = ? WHERE episode_id = ?",
+                    (title, latest[0]),
+                )
+                self._conn.commit()
+                return
+
+        # Create new episode for this fact
+        title = self._generate_episode_title([fact_id])
+        summary = self._generate_episode_summary([fact_id])
+        self._conn.execute(
+            """
+            INSERT INTO episodes (title, start_time, end_time, fact_count, summary)
+            VALUES (?, ?, ?, 1, ?)
+            """,
+            (title, fact_ts, fact_ts, summary),
+        )
+        new_ep = self._conn.execute(
+            "SELECT last_insert_rowid()"
+        ).fetchone()[0]
+        self._conn.execute(
+            "INSERT INTO episode_facts (episode_id, fact_id) VALUES (?, ?)",
+            (new_ep, fact_id),
+        )
+        self._conn.commit()
+
+    def _next_episode_num(self) -> int:
+        """Return the next sequential episode number."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM episodes"
+        ).fetchone()
+        return (row[0] if row else 0) + 1
+
+    def _generate_episode_title(self, fact_ids: list[int]) -> str:
+        """Generate a title for an episode from its facts' dominant entities."""
+        if not fact_ids:
+            return "Untitled Episode"
+
+        placeholders = ",".join("?" * len(fact_ids))
+        rows = self._conn.execute(
+            f"""
+            SELECT e.name, COUNT(*) as cnt
+            FROM entities e
+            JOIN fact_entities fe ON fe.entity_id = e.entity_id
+            WHERE fe.fact_id IN ({placeholders})
+            GROUP BY e.name
+            ORDER BY cnt DESC
+            LIMIT 3
+            """,
+            fact_ids,
+        ).fetchall()
+
+        if rows:
+            entities = [row[0] for row in rows]
+            return " → ".join(entities)
+
+        # Fallback: use first fact's category
+        cat_row = self._conn.execute(
+            "SELECT category FROM facts WHERE fact_id = ?", (fact_ids[0],)
+        ).fetchone()
+        return cat_row[0] if cat_row else "Untitled Episode"
+
+    def _generate_episode_summary(self, fact_ids: list[int]) -> str:
+        """Generate an algorithmic summary of an episode."""
+        if not fact_ids:
+            return ""
+
+        placeholders = ",".join("?" * len(fact_ids))
+
+        # Dominant category
+        cat_row = self._conn.execute(
+            f"""
+            SELECT category, COUNT(*) as cnt
+            FROM facts WHERE fact_id IN ({placeholders})
+            GROUP BY category ORDER BY cnt DESC LIMIT 1
+            """,
+            fact_ids,
+        ).fetchone()
+        category = cat_row[0] if cat_row else "general"
+
+        # All entities
+        ent_rows = self._conn.execute(
+            f"""
+            SELECT DISTINCT e.name
+            FROM entities e
+            JOIN fact_entities fe ON fe.entity_id = e.entity_id
+            WHERE fe.fact_id IN ({placeholders})
+            ORDER BY e.name
+            """,
+            fact_ids,
+        ).fetchall()
+        entities = [row[0] for row in ent_rows]
+
+        # Average trust
+        trust_row = self._conn.execute(
+            f"SELECT AVG(trust_score) FROM facts WHERE fact_id IN ({placeholders})",
+            fact_ids,
+        ).fetchone()
+        avg_trust = trust_row[0] if trust_row else 0.5
+
+        # Timestamps
+        time_rows = self._conn.execute(
+            f"SELECT MIN(created_at), MAX(created_at) FROM facts WHERE fact_id IN ({placeholders})",
+            fact_ids,
+        ).fetchone()
+
+        parts = [f"[EPISODE] {len(fact_ids)} facts in '{category}'"]
+        if entities:
+            parts.append(f"Entities: {', '.join(entities)}")
+        parts.append(f"Avg trust: {avg_trust:.2f}")
+        if time_rows:
+            parts.append(f"Span: {time_rows[0]} → {time_rows[1]}")
+
+        return ". ".join(parts)
+
+    def get_episode(self, episode_id: int) -> dict | None:
+        """Get episode details including fact count and time range."""
+        row = self._conn.execute(
+            "SELECT * FROM episodes WHERE episode_id = ?", (episode_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def list_episodes(self, limit: int = 50, order: str = "newest") -> list[dict]:
+        """List episodes ordered by time.
+
+        Args:
+            limit: Maximum number of episodes to return.
+            order: 'newest' (default) or 'oldest'.
+        """
+        direction = "DESC" if order == "newest" else "ASC"
+        rows = self._conn.execute(
+            f"SELECT * FROM episodes ORDER BY start_time {direction} LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_episode_facts(self, episode_id: int, limit: int = 50) -> list[dict]:
+        """Get all facts belonging to an episode."""
+        placeholders = ",".join("?" * 1)
+        rows = self._conn.execute(
+            f"""
+            SELECT f.fact_id, f.content, f.category, f.tags,
+                   f.trust_score, f.retrieval_count, f.helpful_count,
+                   f.created_at, f.updated_at
+            FROM facts f
+            JOIN episode_facts ef ON ef.fact_id = f.fact_id
+            WHERE ef.episode_id = ?
+            ORDER BY f.created_at
+            LIMIT ?
+            """,
+            (episode_id, limit),
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Entity helpers
