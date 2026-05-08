@@ -15,14 +15,14 @@ Config in $HERMES_HOME/config.yaml (profile-scoped):
       temporal_decay_half_life: 0
 """
 
-__version__ = "0.1.0"
-
 from __future__ import annotations
 
 import json
 import logging
 import re
 from typing import Any, Dict, List
+
+__version__ = "0.1.0"
 
 # Graceful imports — these aren't available in the standalone test environment.
 # When running tests from the plugin repo, the hermes-agent internals don't exist.
