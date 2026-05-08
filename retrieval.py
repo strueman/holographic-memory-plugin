@@ -171,7 +171,7 @@ class FactRetriever:
                 proximity_score = self._phrase_proximity(query, fact["content"], proximity_terms)
 
             # Combine RRF + proximity
-            score = rrf_score * fact["trust_score"] + proximity_score * 0.15
+            score = rrf_score * fact["trust_score"] + proximity_score * 0.20
 
             # Optional temporal decay
             if self.half_life > 0:
@@ -981,12 +981,12 @@ class FactRetriever:
         # Normalize: smaller span = higher score
         # Use exponential decay: score = e^(-span / scale)
         # Scale = 50 chars means span of 50 → score ~0.37
-        score = math.exp(-span / 50.0)
+        score = math.exp(-span / 30.0)
 
         # Boost if terms are actually adjacent (span < avg term length)
         avg_term_len = sum(len(t) for t in terms) / len(terms)
         if span < avg_term_len:
-            score = min(1.0, score * 1.5)
+            score = min(1.0, score * 2.0)
 
         return score
 
