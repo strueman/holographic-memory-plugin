@@ -132,6 +132,13 @@ _TRUST_MAX       =  1.0
 _EPISODE_GAP_MINUTES = 60   # gap threshold for episode boundaries
 _EPISODE_MAX_SIZE    = 100  # cap episode size to prevent massive clusters
 
+# Cross-level compression (L0 → L1 observations)
+_CONSOLIDATE_MIN_CLUSTER_SIZE = 3    # minimum facts for an observation
+_CONSOLIDATE_MAX_CLUSTER_SIZE = 50   # cap cluster size (takes top by trust)
+_CONSOLIDATE_MIN_TRUST        = 0.4  # minimum trust to include in cluster
+_CONSOLIDATE_OBS_TRUST        = 0.7  # trust for generated observations
+_CONSOLIDATE_MAX_OBS_PER_ENTITY = 5  # max L1 observations per entity
+
 # Entity extraction patterns
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
@@ -219,6 +226,13 @@ class MemoryStore:
 
         # Migrate: create vec0 virtual table for dense vector search (sqlite-vec)
         self._init_vec0()
+
+        # Migrate: add level column for cross-level compression (L0=raw, L1=observation)
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
+        if "level" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN level INTEGER DEFAULT 0")
+            # Backfill: all existing facts are L0
+            self._conn.execute("UPDATE facts SET level = 0 WHERE level IS NULL")
 
         self._conn.commit()
 
@@ -1298,6 +1312,308 @@ class MemoryStore:
                 self._rebuild_bank(category)
 
             return len(rows)
+
+    # ------------------------------------------------------------------
+    # Cross-level compression (L0 → L1 observations)
+    # ------------------------------------------------------------------
+
+    def _find_clusters(self, category: str | None = None) -> list[list[int]]:
+        """Find connected components in the fact_links graph among L0 facts.
+
+        Returns a list of clusters, where each cluster is a list of fact_ids.
+        Only considers L0 facts with trust >= _CONSOLIDATE_MIN_TRUST.
+        Optionally filters by category.
+        """
+        with self._lock:
+            trust_clause = "AND trust_score >= ?"
+            params: list = [_CONSOLIDATE_MIN_TRUST]
+            if category is not None:
+                trust_clause += " AND category = ?"
+                params.append(category)
+
+            # Get L0 facts with links
+            rows = self._conn.execute(f"""
+                SELECT f.fact_id FROM facts f
+                JOIN fact_links fl ON fl.fact_id_a = f.fact_id OR fl.fact_id_b = f.fact_id
+                WHERE f.level = 0
+                  {trust_clause}
+                GROUP BY f.fact_id
+                HAVING COUNT(DISTINCT CASE WHEN fl.fact_id_a = f.fact_id THEN fl.fact_id_b
+                                           WHEN fl.fact_id_b = f.fact_id THEN fl.fact_id_a
+                                      END) > 0
+            """, params).fetchall()
+
+            if not rows:
+                return []
+
+            fact_ids = [r["fact_id"] for r in rows]
+            id_set = set(fact_ids)
+
+            # Build adjacency list
+            adj: dict[int, set[int]] = {fid: set() for fid in fact_ids}
+            placeholders = ",".join("?" * len(fact_ids))
+            link_rows = self._conn.execute(f"""
+                SELECT fact_id_a, fact_id_b FROM fact_links
+                WHERE (fact_id_a IN ({placeholders}) OR fact_id_b IN ({placeholders}))
+                  AND (fact_id_a IN ({placeholders}) OR fact_id_b IN ({placeholders}))
+            """, fact_ids * 4).fetchall()
+
+            for lr in link_rows:
+                a, b = lr["fact_id_a"], lr["fact_id_b"]
+                if a in adj and b in adj:
+                    adj[a].add(b)
+                    adj[b].add(a)
+
+            # BFS connected components
+            visited: set[int] = set()
+            clusters: list[list[int]] = []
+
+            for fid in fact_ids:
+                if fid in visited:
+                    continue
+                # BFS
+                cluster: list[int] = []
+                queue: list[int] = [fid]
+                while queue:
+                    node = queue.pop(0)
+                    if node in visited:
+                        continue
+                    visited.add(node)
+                    cluster.append(node)
+                    for neighbor in adj.get(node, set()):
+                        if neighbor not in visited:
+                            queue.append(neighbor)
+                if len(cluster) >= _CONSOLIDATE_MIN_CLUSTER_SIZE:
+                    # Cap cluster size at _CONSOLIDATE_MAX_CLUSTER_SIZE (take highest trust)
+                    if len(cluster) > _CONSOLIDATE_MAX_CLUSTER_SIZE:
+                        trust_rows = self._conn.execute(f"""
+                            SELECT fact_id, trust_score FROM facts
+                            WHERE fact_id IN ({",".join("?" * len(cluster))})
+                            ORDER BY trust_score DESC
+                        """, cluster).fetchall()
+                        cluster = [r["fact_id"] for r in trust_rows[:_CONSOLIDATE_MAX_CLUSTER_SIZE]]
+                    clusters.append(cluster)
+
+            return clusters
+
+    def _get_cluster_entities(self, cluster: list[int]) -> set[str]:
+        """Get all entities linked to facts in a cluster."""
+        placeholders = ",".join("?" * len(cluster))
+        rows = self._conn.execute(f"""
+            SELECT DISTINCT e.name FROM entities e
+            JOIN fact_entities fe ON fe.entity_id = e.entity_id
+            WHERE fe.fact_id IN ({placeholders})
+        """, cluster).fetchall()
+        return {row["name"].lower() for row in rows}
+
+    def _generate_cluster_summary(self, cluster: list[int]) -> dict:
+        """Generate a summary dict for a cluster of facts."""
+        placeholders = ",".join("?" * len(cluster))
+
+        # Shared entities (appearing in >= 60% of cluster facts)
+        entity_rows = self._conn.execute(f"""
+            SELECT e.name, COUNT(*) as cnt FROM entities e
+            JOIN fact_entities fe ON fe.entity_id = e.entity_id
+            WHERE fe.fact_id IN ({placeholders})
+            GROUP BY e.name
+            ORDER BY cnt DESC
+        """, cluster).fetchall()
+        shared_entities = [
+            row["name"] for row in entity_rows
+            if row["cnt"] >= len(cluster) * 0.6 and row["cnt"] >= 2
+        ]
+
+        # Dominant category
+        cat_row = self._conn.execute(f"""
+            SELECT category, COUNT(*) as cnt
+            FROM facts WHERE fact_id IN ({placeholders})
+            GROUP BY category ORDER BY cnt DESC LIMIT 1
+        """, cluster).fetchone()
+        dominant_category = cat_row["category"] if cat_row else "general"
+
+        # Average trust
+        trust_row = self._conn.execute(f"""
+            SELECT AVG(trust_score) FROM facts WHERE fact_id IN ({placeholders})
+        """, cluster).fetchone()
+        avg_trust = trust_row[0] if trust_row else 0.5
+
+        # Representative facts (top 3 by trust)
+        rep_rows = self._conn.execute(f"""
+            SELECT fact_id, content FROM facts
+            WHERE fact_id IN ({placeholders})
+            ORDER BY trust_score DESC LIMIT 3
+        """, cluster).fetchall()
+        representative = [row["content"] for row in rep_rows]
+
+        # Keyword overlap (stopword-filtered content words appearing >= 2 times)
+        _STOP_WORDS = {
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "shall", "can", "to", "of", "in", "for",
+            "on", "with", "at", "by", "from", "as", "into", "through", "during",
+            "before", "after", "and", "but", "or", "nor", "not", "so", "yet",
+            "both", "either", "neither", "each", "every", "all", "any", "few",
+            "more", "most", "other", "some", "such", "no", "only", "own", "same",
+            "than", "too", "very", "just", "about", "above", "after", "again",
+        }
+        word_counts: dict[str, int] = {}
+        fact_rows = self._conn.execute(f"""
+            SELECT content FROM facts WHERE fact_id IN ({placeholders})
+        """, cluster).fetchall()
+        for fr in fact_rows:
+            words = re.findall(r'\b\w+\b', fr["content"].lower())
+            for w in words:
+                if len(w) >= 3 and w not in _STOP_WORDS:
+                    word_counts[w] = word_counts.get(w, 0) + 1
+        keywords = sorted(
+            [w for w, c in word_counts.items() if c >= 2],
+            key=lambda w: word_counts[w], reverse=True
+        )[:5]
+
+        return {
+            "shared_entities": shared_entities,
+            "dominant_category": dominant_category,
+            "avg_trust": round(avg_trust, 2),
+            "representative": representative,
+            "keywords": keywords,
+            "cluster_size": len(cluster),
+        }
+
+    def _build_observation_text(self, summary: dict, cluster: list[int]) -> str:
+        """Build observation text from a cluster summary."""
+        entities_str = ", ".join(summary["shared_entities"]) if summary["shared_entities"] else "multiple topics"
+        keywords_str = ", ".join(summary["keywords"]) if summary["keywords"] else "various topics"
+        rep_facts = "; ".join(
+            f"Fact {i+1}: {f[:100]}" for i, f in enumerate(summary["representative"])
+        )
+        return (
+            f"[OBSERVATION] Consolidated from {summary['cluster_size']} facts about "
+            f"{entities_str} around: {keywords_str}. "
+            f"Category: {summary['dominant_category']}. "
+            f"Avg trust: {summary['avg_trust']:.2f}. "
+            f"Key points: {rep_facts}"
+        )
+
+    def _add_observation(
+        self,
+        content: str,
+        category: str,
+        source_fact_ids: list[int],
+        cluster_entities: set[str],
+    ) -> int | None:
+        """Store an L1 observation. Returns fact_id or None if deduplicated."""
+        with self._lock:
+            # Check if observation already exists for this entity set
+            if self._observation_exists(cluster_entities):
+                return None
+
+            # Insert observation as L1 fact
+            cur = self._conn.execute(
+                """
+                INSERT INTO facts (content, category, trust_score, level)
+                VALUES (?, ?, ?, 1)
+                """,
+                (content, category, _CONSOLIDATE_OBS_TRUST),
+            )
+            obs_id: int = cur.lastrowid  # type: ignore
+
+            # Link to source facts
+            for sid in source_fact_ids:
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO fact_links (fact_id_a, fact_id_b, link_type, strength)
+                    VALUES (?, ?, 'consolidation', 1.0)
+                    """,
+                    (obs_id, sid),
+                )
+
+            # Link to shared entities
+            for entity_name in cluster_entities:
+                entity_id = self._resolve_entity(entity_name)
+                self._link_fact_entity(obs_id, entity_id)
+
+            # Compute HRR vector
+            self._compute_hrr_vector(obs_id, content)
+            # Compute embedding
+            self._compute_embedding(obs_id, content)
+
+            self._conn.commit()
+            return obs_id
+
+    def _get_fact_trust(self, fact_id: int) -> float:
+        """Get trust score for a fact."""
+        row = self._conn.execute(
+            "SELECT trust_score FROM facts WHERE fact_id = ?", (fact_id,)
+        ).fetchone()
+        return row["trust_score"] if row else 0.0
+
+    def _observation_exists(self, entity_set: set[str]) -> bool:
+        """Check if an L1 observation covering >= 50% of entity_set already exists."""
+        if not entity_set:
+            return False
+
+        # Get all L1 facts and check their entity overlap
+        l1_rows = self._conn.execute(
+            "SELECT fact_id, content FROM facts WHERE level = 1"
+        ).fetchall()
+
+        for lr in l1_rows:
+            # Get entities for this observation
+            obs_entities = self._get_fact_entities(lr["fact_id"])
+            overlap = entity_set & obs_entities
+            if len(overlap) >= len(entity_set) * 0.5:
+                return True
+
+        return False
+
+    def consolidate(self, category: str | None = None) -> dict:
+        """Run cross-level compression: group related L0 facts into L1 observations.
+
+        Uses BFS connected components on the fact_links graph to find clusters
+        of related facts, then generates algorithmic observations for each cluster.
+
+        Args:
+            category: Optional category filter. None = all categories.
+
+        Returns:
+            {clusters_found, clusters_eligible, observations_created,
+             observations_skipped, facts_consolidated}
+        """
+        with self._lock:
+            # Find clusters
+            clusters = self._find_clusters(category)
+            clusters_found = len(clusters)
+
+            observations_created = 0
+            observations_skipped = 0
+            facts_consolidated = 0
+
+            for cluster in clusters:
+                summary = self._generate_cluster_summary(cluster)
+                observation_text = self._build_observation_text(summary, cluster)
+                cluster_entities = self._get_cluster_entities(cluster)
+
+                result = self._add_observation(
+                    content=observation_text,
+                    category=summary["dominant_category"],
+                    source_fact_ids=cluster,
+                    cluster_entities=cluster_entities,
+                )
+
+                if result is not None:
+                    observations_created += 1
+                    facts_consolidated += len(cluster)
+                else:
+                    observations_skipped += 1
+
+            return {
+                "clusters_found": clusters_found,
+                "clusters_eligible": len([c for c in clusters
+                                          if len(c) >= _CONSOLIDATE_MIN_CLUSTER_SIZE]),
+                "observations_created": observations_created,
+                "observations_skipped": observations_skipped,
+                "facts_consolidated": facts_consolidated,
+            }
 
     # ------------------------------------------------------------------
     # Utilities
