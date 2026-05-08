@@ -116,9 +116,9 @@ CREATE INDEX IF NOT EXISTS idx_episode_facts_fact ON episode_facts(fact_id);
 """
 
 # Structural linking thresholds
-_HRR_LINK_THRESHOLD    = 0.65  # Normalized HRR sim; raw ~0.3 (above random ~0.0)
+_HRR_LINK_THRESHOLD    = 0.55  # Normalized HRR sim; lowered from 0.65 for current corpus
 _ENTITY_LINK_THRESHOLD = 0.25  # Jaccard overlap on entity sets
-_EMB_LINK_THRESHOLD    = 0.75  # Cosine similarity for embeddings
+_EMB_LINK_THRESHOLD    = 0.70  # Cosine similarity for embeddings; lowered from 0.75
 _LINK_COMPARE_LIMIT    = 100   # Max facts to compare against per new fact
 _LINKS_PER_FACT_MAX    = 20    # Max outgoing links per fact
 
