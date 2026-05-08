@@ -609,6 +609,8 @@ if __name__ == "__main__":
         if not queries_data:
             print("Error: No LongMemEval queries loaded. Prepare the DB first with prepare_longmemeval_db.py")
             sys.exit(1)
+        # Use LME DB as store too (not just for queries)
+        db_path = lme_db
     else:
         queries_data = None  # use GOLDEN_QUERIES with filtering
 
