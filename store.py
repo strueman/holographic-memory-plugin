@@ -312,6 +312,9 @@ class MemoryStore:
         Returns the number of facts that were backfilled.
         """
         with self._lock:
+            if not _HAS_SQLITE_VEC:
+                return 0
+
             try:
                 from . import embedding as emb_mod
             except ImportError:
