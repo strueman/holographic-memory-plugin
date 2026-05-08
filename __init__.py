@@ -15,6 +15,8 @@ Config in $HERMES_HOME/config.yaml (profile-scoped):
       temporal_decay_half_life: 0
 """
 
+__version__ = "0.1.0"
+
 from __future__ import annotations
 
 import json
