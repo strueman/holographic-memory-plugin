@@ -198,6 +198,44 @@ def load_longmemeval_queries(
     return queries
 
 
+def load_custom_queries(db_path: Path) -> List[dict]:
+    """Load queries from a custom benchmark database with a 'queries' table."""
+    if not db_path.exists():
+        print(f"Error: Custom DB not found at {db_path}")
+        return []
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+
+    # Check if queries table exists
+    tables = [r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()]
+    if "queries" not in tables:
+        print(f"Error: 'queries' table not found in {db_path}")
+        print(f"Available tables: {tables}")
+        conn.close()
+        return []
+
+    queries = conn.execute("SELECT * FROM queries").fetchall()
+    conn.close()
+
+    if not queries:
+        print("Error: queries table is empty")
+        return []
+
+    result = []
+    for row in queries:
+        expected_ids = json.loads(row[3])
+        result.append({
+            "query": row[1],
+            "expected": expected_ids,
+            "query_type": row[2] if row[2] else "personal-memory",
+        })
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Tokenization (for legacy standalone mode)
 # ---------------------------------------------------------------------------
@@ -470,9 +508,9 @@ def run_benchmark(
 
     for i, q in enumerate(all_queries, 1):
         query_text = q["query"]
-        expected = q["expected_facts"]
-        qtype = q["type"]
-        desc = q["description"]
+        expected = q.get("expected_facts", q.get("expected", []))
+        qtype = q.get("type", q.get("query_type", "general"))
+        desc = q.get("description", q.get("query", "query"))
 
         if live:
             # Live mode: call the real search() directly
@@ -594,6 +632,8 @@ if __name__ == "__main__":
                         help="Use LongMemEval oracle dataset instead of golden queries")
     parser.add_argument("--lme-db", type=str, default=None,
                         help="Path to LongMemEval benchmark DB (default: same as --db)")
+    parser.add_argument("--queries-db", type=str, default=None,
+                        help="Path to custom benchmark DB with queries table")
     parser.add_argument("--lme-subset", type=int, default=None,
                         help="Number of LongMemEval instances to use")
     parser.add_argument("--live", action="store_true",
@@ -611,6 +651,11 @@ if __name__ == "__main__":
             sys.exit(1)
         # Use LME DB as store too (not just for queries)
         db_path = lme_db
+    elif args.queries_db:
+        queries_data = load_custom_queries(Path(args.queries_db))
+        if not queries_data:
+            print("Error: No queries loaded from custom DB")
+            sys.exit(1)
     else:
         queries_data = None  # use GOLDEN_QUERIES with filtering
 
