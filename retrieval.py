@@ -151,6 +151,16 @@ class FactRetriever:
             rrf_score += 1.0 / (hrr_rank + _RRF_C)
             source_count += 1
 
+            # Access count boost: retrieval_count + helpful_count as 4th signal
+            retrieval_count = fact.get("retrieval_count", 0) or 0
+            helpful_count = fact.get("helpful_count", 0) or 0
+            _MAX_ACCESS = 10  # cap for normalization
+            combined = retrieval_count * 0.3 + helpful_count * 0.7
+            access_score = min(1.0, combined / _MAX_ACCESS)
+            access_rank = max(1, int((1.0 - access_score) * len(all_candidates)) + 1)
+            rrf_score += 1.0 / (access_rank + _RRF_C)
+            source_count += 1
+
             # Normalize by number of sources
             if source_count > 0:
                 rrf_score /= source_count
