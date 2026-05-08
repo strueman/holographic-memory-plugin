@@ -426,6 +426,12 @@ class HolographicMemoryProvider(MemoryProvider):
                 stats = store.segment_episodes(gap_minutes=gap)
                 return json.dumps(stats)
 
+            elif action == "consolidate":
+                category = args.get("category")
+                result = store.consolidate(category=category)
+                return json.dumps(result)
+
+
             else:
                 return tool_error(f"Unknown action: {action}")
 
