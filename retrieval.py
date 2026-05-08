@@ -101,9 +101,13 @@ class FactRetriever:
         for rank, fact in enumerate(vec_candidates, start=1):
             vec_rank_map[fact["fact_id"]] = rank
 
-        # Stage 3: Compute per-candidate scores using RRF fusion
+        # Stage 3: Compute per-candidate scores using RRF fusion + proximity
         query_tokens = self._tokenize(query)
         scored = []
+
+        # Extract meaningful query terms for proximity scoring
+        proximity_terms = [t for t in query_tokens
+                          if t.lower() not in self._STOP_WORDS and len(t) >= 3]
 
         for fact in all_candidates:
             content_tokens = self._tokenize(fact["content"])
@@ -151,8 +155,13 @@ class FactRetriever:
             if source_count > 0:
                 rrf_score /= source_count
 
-            # Trust weighting
-            score = rrf_score * fact["trust_score"]
+            # Phrase proximity bonus: closer query terms in content = higher score
+            proximity_score = 0.0
+            if proximity_terms:
+                proximity_score = self._phrase_proximity(query, fact["content"], proximity_terms)
+
+            # Combine RRF + proximity
+            score = rrf_score * fact["trust_score"] + proximity_score * 0.15
 
             # Optional temporal decay
             if self.half_life > 0:
@@ -920,6 +929,56 @@ class FactRetriever:
         intersection = len(set_a & set_b)
         union = len(set_a | set_b)
         return intersection / union if union > 0 else 0.0
+
+    def _phrase_proximity(self, query: str, content: str, terms: list[str]) -> float:
+        """Calculate phrase proximity score for query terms in content.
+
+        Finds the physical span (distance between first and last occurrence)
+        of query terms in the content. Closer terms = higher relevance.
+
+        Returns a score in [0, 1] where 1.0 means all terms are adjacent.
+
+        For a single term, returns 0.5 (neutral — proximity is undefined).
+        """
+        if not terms:
+            return 0.0
+
+        content_lower = content.lower()
+        positions: list[int] = []
+
+        for term in terms:
+            # Find all occurrences of this term in content
+            start = 0
+            while True:
+                idx = content_lower.find(term, start)
+                if idx == -1:
+                    break
+                positions.append(idx)
+                start = idx + 1
+
+        if not positions:
+            return 0.0
+
+        # If only one term found, neutral score
+        if len(positions) <= 1:
+            return 0.5
+
+        # Calculate span: distance between first and last occurrence
+        min_pos = min(positions)
+        max_pos = max(positions)
+        span = max_pos - min_pos
+
+        # Normalize: smaller span = higher score
+        # Use exponential decay: score = e^(-span / scale)
+        # Scale = 50 chars means span of 50 → score ~0.37
+        score = math.exp(-span / 50.0)
+
+        # Boost if terms are actually adjacent (span < avg term length)
+        avg_term_len = sum(len(t) for t in terms) / len(terms)
+        if span < avg_term_len:
+            score = min(1.0, score * 1.5)
+
+        return score
 
     def _temporal_decay(self, timestamp_str: str | None) -> float:
         """Exponential decay: 0.5^(age_days / half_life_days).
