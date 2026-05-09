@@ -30,24 +30,104 @@ class FactRetriever:
         self,
         store: MemoryStore,
         temporal_decay_half_life: int = 0,  # days, 0 = disabled
-        fts_weight: float = 0.4,
-        jaccard_weight: float = 0.3,
-        hrr_weight: float = 0.3,
         hrr_dim: int = 1024,
     ):
         self.store = store
         self.half_life = temporal_decay_half_life
         self.hrr_dim = hrr_dim
 
-        # Auto-redistribute weights if numpy unavailable
-        if hrr_weight > 0 and not hrr._HAS_NUMPY:
-            fts_weight = 0.6
-            jaccard_weight = 0.4
-            hrr_weight = 0.0
+        # Compute IDF weights from FTS5 metadata (cached per-retriever)
+        self._idf_cache: dict[str, float] | None = None
+        self._idf_computed = False
+        try:
+            self._compute_idf()
+        except Exception:
+            # FTS5 metadata may not exist (e.g., empty DB) — IDF will be 1.0
+            self._idf_computed = False
 
-        self.fts_weight = fts_weight
-        self.jaccard_weight = jaccard_weight
-        self.hrr_weight = hrr_weight
+    def _compute_idf(self) -> None:
+        """Compute IDF weights by querying FTS5 document frequency per term.
+
+        Since FTS5's _meta table isn't available in all SQLite versions,
+        we compute IDF by counting how many facts contain each term
+        (document frequency) via FTS5 MATCH queries.
+
+        Caches results in self._idf_cache for reuse across queries.
+        """
+        conn = self.store._conn
+        total = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        if total == 0:
+            self._idf_cache = {}
+            self._idf_computed = True
+            return
+
+        # Get all unique terms from the FTS5 index by querying _data table
+        # FTS5 stores terms in a flat index; we extract unique terms from it
+        try:
+            # Try the internal table approach first (SQLite 3.35+)
+            rows = conn.execute(
+                "SELECT term FROM facts_fts('internal')"
+            ).fetchall()
+            unique_terms = set()
+            for row in rows:
+                # Internal table returns content bytes; decode and tokenize
+                content = row[0] if isinstance(row[0], str) else row[0].decode('utf-8', errors='replace')
+                for token in content.split():
+                    unique_terms.add(token.lower())
+        except Exception:
+            # Fallback: scan all fact content to extract terms
+            fact_rows = conn.execute("SELECT content FROM facts").fetchall()
+            unique_terms = set()
+            for row in fact_rows:
+                for token in self._tokenize(row["content"]):
+                    unique_terms.add(token)
+
+        # Compute IDF for each term
+        self._idf_cache = {}
+        for term in unique_terms:
+            # Count documents containing this term
+            try:
+                df = conn.execute(
+                    "SELECT COUNT(*) FROM facts_fts JOIN facts ON facts.fact_id = facts_fts.rowid WHERE facts_fts MATCH ?",
+                    (term,),
+                ).fetchone()[0]
+            except Exception:
+                df = 0
+
+            if df > 0 and df < total:
+                # Standard IDF: log(N / df), clamped to [0, 10]
+                idf = math.log(total / df)
+                self._idf_cache[term] = min(idf, 10.0)
+            else:
+                self._idf_cache[term] = 0.0
+        self._idf_computed = True
+
+    def _query_idf(self, query: str) -> float:
+        """Compute average IDF for meaningful query terms.
+
+        Returns a boost factor in [1.0, ~2.5]. A query with only common terms
+        (low IDF) returns ~1.0 (no boost). A query with rare terms (high IDF)
+        returns a larger boost.
+
+        This amplifies the FTS5 contribution for queries that contain rare,
+        discriminative terms.
+        """
+        if not self._idf_computed or not self._idf_cache:
+            return 1.0
+
+        tokens = self._tokenize(query)
+        idf_values = [
+            self._idf_cache.get(t, 0.0)
+            for t in tokens
+            if t.lower() not in self._STOP_WORDS and len(t) >= 3
+        ]
+
+        if not idf_values:
+            return 1.0
+
+        avg_idf = sum(idf_values) / len(idf_values)
+        # Dampen: 1 + log(1 + avg_idf) gives [1.0, ~2.3] for typical corpora
+        return 1.0 + math.log(1.0 + avg_idf)
 
     def search(
         self,
@@ -62,10 +142,13 @@ class FactRetriever:
 
         Pipeline:
         1. FTS5 search: Get limit*3 candidates from SQLite full-text search
-        2. Jaccard boost: Token overlap between query and fact content
-        3. Trust weighting: final_score = relevance * trust_score
-        4. Temporal decay (optional): decay = 0.5^(age_days / half_life)
-        5. Evidence-gap analysis (optional): check query coverage
+        2. IDF boost: Compute query-level IDF from FTS5 metadata, amplify FTS5 RRF
+        3. Vec KNN: Get limit*3 candidates from dense vector search (sqlite-vec)
+        4. RRF fusion: Combine FTS5 (IDF-weighted), Vec, Jaccard, HRR, access count
+        5. Phrase proximity: Bonus for query terms appearing close together
+        6. Trust weighting: final_score = relevance * trust_score
+        7. Temporal decay (optional): decay = 0.5^(age_days / half_life)
+        8. Evidence-gap analysis (optional): check query coverage
 
         Returns list of dicts with fact data + 'score' field, sorted by score desc.
         If evidence_gap is True, the first result includes an 'evidence_gap' dict.
@@ -109,6 +192,9 @@ class FactRetriever:
         proximity_terms = [t for t in query_tokens
                           if t.lower() not in self._STOP_WORDS and len(t) >= 3]
 
+        # Compute IDF boost for this query (amplifies rare terms)
+        idf_boost = self._query_idf(query)
+
         for fact in all_candidates:
             content_tokens = self._tokenize(fact["content"])
             tag_tokens = self._tokenize(fact.get("tags", ""))
@@ -118,7 +204,7 @@ class FactRetriever:
             jaccard = self._jaccard_similarity(query_tokens, all_tokens)
 
             # HRR similarity
-            if self.hrr_weight > 0 and fact.get("hrr_vector"):
+            if hrr._HAS_NUMPY and fact.get("hrr_vector"):
                 fact_vec = hrr.bytes_to_phases(fact["hrr_vector"])
                 query_vec = hrr.encode_text(query, self.hrr_dim)
                 hrr_sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0
@@ -130,9 +216,11 @@ class FactRetriever:
             rrf_score = 0.0
             source_count = 0
 
-            # FTS5 rank contribution
+            # FTS5 rank contribution — weighted by query-level IDF
+            # Rare query terms amplify the FTS5 signal; common terms don't
             if fact["fact_id"] in fts_rank_map:
-                rrf_score += 1.0 / (fts_rank_map[fact["fact_id"]] + _RRF_C)
+                fts_term = 1.0 / (fts_rank_map[fact["fact_id"]] + _RRF_C)
+                rrf_score += fts_term * idf_boost
                 source_count += 1
 
             # Vec rank contribution

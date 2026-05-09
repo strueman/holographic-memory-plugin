@@ -294,24 +294,41 @@ class TestEdgeCases:
         assert len(results) == 1
         assert "This is the only fact" in results[0]["content"]
 
-    def test_deprecated_weights_ignored(self):
-        """Weight parameters are accepted for backward compatibility."""
+    def test_idf_boost_applied(self):
+        """IDF boost amplifies FTS5 contribution for rare-term queries."""
         store = MockMemoryStore()
-        store.add_fact("test fact")
+        # Add facts with varying term rarity
+        store.add_fact("The user has a Samsung Galaxy S22 phone")
+        store.add_fact("The user has a Dell XPS laptop")
+        store.add_fact("The user has an Apple MacBook Pro laptop")
+        store.add_fact("The user has a Sony TV in the living room")
+        store.add_fact("The user has a Google Home speaker")
         import retrieval as ret
         with patch.object(ret, "hrr", FakeHrrModule):
             from retrieval import FactRetriever
-            # Should not raise — weights are accepted but RRF is the primary scoring
-            retriever = FactRetriever(
-                store,
-                fts_weight=0.1,
-                jaccard_weight=0.2,
-                hrr_weight=0.7,
-            )
-        # Weights are still stored for backward compat and auto-redistribution
-        assert hasattr(retriever, "fts_weight")
-        assert hasattr(retriever, "jaccard_weight")
-        assert hasattr(retriever, "hrr_weight")
+            retriever = FactRetriever(store)
+        # Verify IDF cache was populated
+        assert retriever._idf_computed
+        assert retriever._idf_cache is not None
+        # Verify IDF boost is computed for a query with rare terms
+        boost = retriever._query_idf("Samsung Galaxy S22")
+        assert boost >= 1.0  # At minimum, no negative boost
+        # Verify a query with only common terms gets lower boost
+        common_boost = retriever._query_idf("the user has a")
+        assert common_boost >= 1.0
+        # Rare-term query should get equal or higher boost than common query
+        assert boost >= common_boost
+
+    def test_idf_no_crash_on_empty_store(self):
+        """IDF initialization handles empty stores gracefully."""
+        store = MockMemoryStore()
+        import retrieval as ret
+        with patch.object(ret, "hrr", FakeHrrModule):
+            from retrieval import FactRetriever
+            retriever = FactRetriever(store)
+        # Should not crash — IDF cache may be empty
+        boost = retriever._query_idf("some query")
+        assert boost == 1.0  # Returns 1.0 when no IDF computed
 
     def test_temporal_decay_applied(self):
         """Temporal decay should reduce scores for older facts."""
