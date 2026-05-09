@@ -4,6 +4,8 @@ A lightweight, single-user memory plugin for [Hermes Agent](https://github.com/N
 
 > **Attribution:** Original plugin by [dusterbloom](https://github.com/dusterbloom) (PR [#2351](https://github.com/NousResearch/hermes-agent/pull/2351)), adapted to the `MemoryProvider` ABC.
 
+> **Multilingual roadmap:** Three-layer approach for multilingual support — (1) **Query expansion** via Cygnet (multi-language WordNet), (2) **Search routing** (PR #1: language-aware routing, English→FTS5, Chinese→jieba), (3) **Cross-encoder reranking** (language-agnostic). See [roadmap](https://github.com/strueman/holographic-memory-plugin/blob/main/summaries/holographic-query-expansion-and-reranking-roadmap-2026.md).
+
 ## Features
 
 - **HRR compositional memory** — bind roles and entities into algebraic vectors; probe and reason across entities using vector unbinding
