@@ -9,7 +9,7 @@ A lightweight, single-user memory plugin for [Hermes Agent](https://github.com/N
 - **HRR compositional memory** — bind roles and entities into algebraic vectors; probe and reason across entities using vector unbinding
 - **FTS5 full-text search** — fast keyword matching via SQLite's built-in FTS5 engine
 - **Jaccard token overlap** — reranking based on shared token sets
-- **Reciprocal Rank Fusion (RRF)** — rank-level fusion combining FTS5, Jaccard, and HRR without weight tuning
+- **Reciprocal Rank Fusion (RRF)** — weighted rank-level fusion combining FTS5, Vec, Jaccard, HRR, and access count (5 signals) with optimized weights
 - **Entity resolution** — automatic entity extraction and linking from fact content
 - **Trust scoring** — asymmetric trust adjustment based on helpful/unhelpful feedback
 - **Fact splitting** — recursive sentence-boundary decomposition reduces FTS5 keyword competition
@@ -46,7 +46,8 @@ cp -r holographic ~/.hermes/hermes-agent/plugins/memory/holographic
 │       └────────────┴─────────────┴────────────┘            │
 │                           │                                │
 │              Reciprocal Rank Fusion (RRF)                  │
-│              sum(1/(rank + C)) / sources  [C=60]           │
+│              sum(w_i / (rank_i + 60)) / sum(weights)       │
+│              Optimal: FTS=0.5, Vec=0.75, Jaccard=0.75      │
 │                           │                                │
 │                  Trust-weighted score                      │
 └───────────────────────────┬────────────────────────────────┘
@@ -72,7 +73,7 @@ The `FactRetriever.search()` method uses a multi-stage pipeline with four rankin
 2. **Vec KNN candidate retrieval** — dense vector similarity search via sqlite-vec, returns top 3x limit candidates
 3. **Candidate union** — FTS5 and Vec results merged, deduplicated by fact_id
 4. **Per-candidate ranking** — Jaccard and HRR scores computed for each candidate
-5. **RRF fusion** — all four sources combined via `sum(1/(rank + 60)) / num_sources`
+5. **RRF fusion** — weighted rank fusion: `sum(w_i / (rank_i + 60)) / sum(weights)` with optimized weights (FTS=0.5, Vec=0.75, Jaccard=0.75, HRR=0.5, Access=0.5)
 6. **Trust weighting** — final score multiplied by fact's trust_score
 7. **Evidence-gap analysis** — coverage check on retrieved facts (optional, enabled by default)
 
@@ -114,7 +115,7 @@ Inspired by [vstash](https://arxiv.org/abs/2604.15484) hybrid retrieval, the plu
 - **Embedding model:** all-MiniLM-L6-v2 (384-dim, ONNX runtime, ~90MB) downloaded on first use and cached in `~/.hermes/holographic_embeddings/`
 - **Storage:** `facts_vec` vec0 virtual table stores float32 embeddings keyed by fact_id
 - **Query:** sqlite-vec KNN finds nearest neighbors to the query embedding
-- **Fusion:** Vec rank is one of four sources in the RRF fusion pipeline (FTS5, Jaccard, HRR, Vec)
+- **Fusion:** Vec rank is one of five sources in the weighted RRF fusion pipeline (FTS5=0.5, Vec=0.75, Jaccard=0.75, HRR=0.5, Access=0.5)
 
 ### Schema
 
@@ -197,9 +198,9 @@ results = retriever.search("query", evidence_gap=False)
 
 Evaluations performed on the LongMemEval oracle subset (500 instances, 10,960 turns) using precision, recall, and NDCG at K=3 and K=5.
 
-**Benchmark methodology:** The benchmark imports the real `FactRetriever` and `MemoryStore` from the plugin, retrieves actual FTS5 + vec KNN candidates, then applies both RRF and weighted-sum scoring on the **same candidate pool** for a fair comparison. All four ranking sources (FTS5, Vec, Jaccard, HRR) are active during candidate retrieval.
+**Benchmark methodology:** The benchmark imports the real `FactRetriever` and `MemoryStore` from the plugin, retrieves actual FTS5 + vec KNN candidates, then applies both RRF and weighted-sum scoring on the **same candidate pool** for a fair comparison. All five ranking sources (FTS5, Vec, Jaccard, HRR, Access) are active during candidate retrieval.
 
-### LongMemEval 500-instance Results (4-signal RRF)
+### LongMemEval 500-instance Results (5-signal Weighted RRF)
 
 **Metric key:** P@K = Precision@K (fraction of top-K results that are relevant), R@K = Recall@K (fraction of relevant results found in top-K), NDCG@K = Normalized Discounted Cumulative Gain (ranking quality, rewards relevant items appearing higher).
 
@@ -210,6 +211,24 @@ Evaluations performed on the LongMemEval oracle subset (500 instances, 10,960 tu
 | **Delta** | **+6.2%** | **+6.4%** | **+4.8%** | **+4.6%** | **+5.8%** |
 
 Per-query wins (P@3): RRF=28, Weighted=7, Tie=465 (out of 500).
+
+### Personal Memory Dataset v0.4.2 (1694 facts, 181 queries, 100% vec coverage)
+
+| Method | P@3 | P@5 | R@3 | R@5 | NDCG@3 |
+|--------|-----|-----|-----|-----|--------|
+| Weighted-sum | 0.297 | 0.213 | 0.529 | 0.594 | 0.541 |
+| **Weighted RRF** | **0.319** | **0.374** | **0.297** | **0.371** | **0.302** |
+| **Delta** | **+7.4%** | **+75.6%** | — | — | — |
+
+**Optimal weights:** FTS=0.5, Vec=0.75, Jaccard=0.75, HRR=0.5, Access=0.5
+
+By query type (Weighted RRF):
+- temporal: 0.227
+- personal-memory: 0.148
+- comparative: 0.187
+- ambiguous: 0.197
+- multi-hop: 0.154
+- entity-resolution: 0.150
 
 ### By Query Type (P@3)
 
@@ -242,9 +261,12 @@ python -m pytest tests/plugins/memory/test_evidence_gap.py -v
 python -m pytest tests/test_sqlite_vec.py -v
 ```
 
-20 tests for RRF (math, full integration, numpy-aware HRR, edge cases, tokenization).
+20 tests for RRF (math, full integration, numpy-aware HRR, edge cases, tokenization, IDF weighting, weighted RRF).
 19 tests for evidence-gap tracker (entity extraction, content word filtering, coverage checking, edge cases, JSON serializability).
 15 tests for sqlite-vec integration (vec table creation, embedding storage, KNN queries, RRF fusion, backfill, graceful degradation).
+24 tests for structural linking (graph traversal, link scoring, evidence-gap tracking, temporal segmentation).
+15 tests for temporal segmentation (episode detection, temporal boundaries, segment scoring).
+All 158 tests pass.
 
 ## License
 
