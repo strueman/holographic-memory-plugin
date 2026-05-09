@@ -268,7 +268,9 @@ def _rrf_score_candidates(
     limit: int,
     rrf_c: int = 60,
 ) -> List[dict]:
-    """Apply RRF fusion on the candidate pool (mirrors FactRetriever.search)."""
+    """Apply weighted RRF fusion on the candidate pool (mirrors FactRetriever.search)."""
+    from retrieval import _RRF_WEIGHTS
+
     # Union candidates, deduplicate
     seen_ids = set()
     all_candidates = []
@@ -291,6 +293,9 @@ def _rrf_score_candidates(
     # Tokenize for Jaccard
     query_tokens = retriever._tokenize(query)
 
+    # Compute IDF boost
+    idf_boost = retriever._query_idf(query)
+
     scored = []
     for fact in all_candidates:
         content_tokens = retriever._tokenize(fact["content"])
@@ -300,29 +305,35 @@ def _rrf_score_candidates(
         # Jaccard
         jaccard = retriever._jaccard_similarity(query_tokens, all_tokens)
 
-        # RRF fusion
+        # Weighted RRF fusion
         rrf_score = 0.0
-        source_count = 0
+        weight_sum = 0.0
 
         if fact["fact_id"] in fts_rank_map:
-            rrf_score += 1.0 / (fts_rank_map[fact["fact_id"]] + rrf_c)
-            source_count += 1
+            fts_term = 1.0 / (fts_rank_map[fact["fact_id"]] + rrf_c)
+            rrf_score += fts_term * idf_boost * _RRF_WEIGHTS["fts"]
+            weight_sum += _RRF_WEIGHTS["fts"]
         if fact["fact_id"] in vec_rank_map:
-            rrf_score += 1.0 / (vec_rank_map[fact["fact_id"]] + rrf_c)
-            source_count += 1
+            rrf_score += 1.0 / (vec_rank_map[fact["fact_id"]] + rrf_c) * _RRF_WEIGHTS["vec"]
+            weight_sum += _RRF_WEIGHTS["vec"]
 
         # Jaccard rank
         jaccard_rank = max(1, int((1.0 - jaccard) * len(all_candidates)) + 1)
-        rrf_score += 1.0 / (jaccard_rank + rrf_c)
-        source_count += 1
+        rrf_score += 1.0 / (jaccard_rank + rrf_c) * _RRF_WEIGHTS["jaccard"]
+        weight_sum += _RRF_WEIGHTS["jaccard"]
 
-        # HRR rank (use neutral default for benchmark — HRR is consistent across methods)
+        # HRR rank (neutral default for benchmark consistency)
         hrr_rank = max(1, int(0.5 * len(all_candidates)) + 1)
-        rrf_score += 1.0 / (hrr_rank + rrf_c)
-        source_count += 1
+        rrf_score += 1.0 / (hrr_rank + rrf_c) * _RRF_WEIGHTS["hrr"]
+        weight_sum += _RRF_WEIGHTS["hrr"]
 
-        if source_count > 0:
-            rrf_score /= source_count
+        # Access count (neutral for benchmark)
+        access_rank = max(1, int(0.5 * len(all_candidates)) + 1)
+        rrf_score += 1.0 / (access_rank + rrf_c) * _RRF_WEIGHTS["access"]
+        weight_sum += _RRF_WEIGHTS["access"]
+
+        if weight_sum > 0:
+            rrf_score /= weight_sum
 
         score = rrf_score * fact["trust_score"]
         fact["score"] = score

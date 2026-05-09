@@ -22,6 +22,18 @@ except ImportError:
 # RRF constant — exposed for testing
 _RRF_C = 60
 
+# Default signal weights for weighted RRF
+# Optimized via grid search on personal memory benchmark (v0.4.1)
+# FTS is down-weighted relative to equal weighting to let vec/Jaccard help
+# where FTS is ambiguous; jaccard is up-weighted for semantic overlap
+_RRF_WEIGHTS = {
+    "fts": 0.5,       # FTS5 gets 0.5x (down-weighted — IDF boost already amplifies)
+    "vec": 0.75,      # Vec gets 0.75x (essential for multi-hop)
+    "jaccard": 0.75,  # Jaccard gets 0.75x (up-weighted for semantic overlap)
+    "hrr": 0.5,       # HRR gets 0.5x
+    "access": 0.5,    # Access count gets 0.5x
+}
+
 
 class FactRetriever:
     """Multi-strategy fact retrieval with trust-weighted scoring."""
@@ -211,33 +223,34 @@ class FactRetriever:
             else:
                 hrr_sim = 0.5  # neutral
 
-            # RRF fusion: combine ranks from multiple sources
-            # Each source contributes 1/(rank + C) where rank starts at 1
+            # RRF fusion: combine ranks from multiple sources with weights
+            # Weighted: sum(weight_i * 1/(rank_i + C)) / sum(weight_i)
+            # This prevents noisy signals from diluting strong signals
             rrf_score = 0.0
-            source_count = 0
+            weight_sum = 0.0
 
             # FTS5 rank contribution — weighted by query-level IDF
             # Rare query terms amplify the FTS5 signal; common terms don't
             if fact["fact_id"] in fts_rank_map:
                 fts_term = 1.0 / (fts_rank_map[fact["fact_id"]] + _RRF_C)
-                rrf_score += fts_term * idf_boost
-                source_count += 1
+                rrf_score += fts_term * idf_boost * _RRF_WEIGHTS["fts"]
+                weight_sum += _RRF_WEIGHTS["fts"]
 
             # Vec rank contribution
             if fact["fact_id"] in vec_rank_map:
-                rrf_score += 1.0 / (vec_rank_map[fact["fact_id"]] + _RRF_C)
-                source_count += 1
+                rrf_score += 1.0 / (vec_rank_map[fact["fact_id"]] + _RRF_C) * _RRF_WEIGHTS["vec"]
+                weight_sum += _RRF_WEIGHTS["vec"]
 
             # Jaccard rank contribution (compute rank from similarity)
             # Higher jaccard = lower rank number
             jaccard_rank = max(1, int((1.0 - jaccard) * len(all_candidates)) + 1)
-            rrf_score += 1.0 / (jaccard_rank + _RRF_C)
-            source_count += 1
+            rrf_score += 1.0 / (jaccard_rank + _RRF_C) * _RRF_WEIGHTS["jaccard"]
+            weight_sum += _RRF_WEIGHTS["jaccard"]
 
             # HRR rank contribution
             hrr_rank = max(1, int((1.0 - hrr_sim) * len(all_candidates)) + 1)
-            rrf_score += 1.0 / (hrr_rank + _RRF_C)
-            source_count += 1
+            rrf_score += 1.0 / (hrr_rank + _RRF_C) * _RRF_WEIGHTS["hrr"]
+            weight_sum += _RRF_WEIGHTS["hrr"]
 
             # Access count boost: retrieval_count + helpful_count as 4th signal
             retrieval_count = fact.get("retrieval_count", 0) or 0
@@ -246,12 +259,12 @@ class FactRetriever:
             combined = retrieval_count * 0.3 + helpful_count * 0.7
             access_score = min(1.0, combined / _MAX_ACCESS)
             access_rank = max(1, int((1.0 - access_score) * len(all_candidates)) + 1)
-            rrf_score += 1.0 / (access_rank + _RRF_C)
-            source_count += 1
+            rrf_score += 1.0 / (access_rank + _RRF_C) * _RRF_WEIGHTS["access"]
+            weight_sum += _RRF_WEIGHTS["access"]
 
-            # Normalize by number of sources
-            if source_count > 0:
-                rrf_score /= source_count
+            # Normalize by sum of weights (not count of sources)
+            if weight_sum > 0:
+                rrf_score /= weight_sum
 
             # Phrase proximity bonus: closer query terms in content = higher score
             proximity_score = 0.0
