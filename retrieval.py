@@ -22,6 +22,31 @@ except ImportError:
 # RRF constant — exposed for testing
 _RRF_C = 60
 
+# Pre-compiled regex for Chinese character detection (hot path optimization)
+# CJK Unified Ideographs block: U+4E00–U+9FFF
+_RE_CHINESE = re.compile(r'[\u4e00-\u9fff]')
+
+# Cached jieba module to avoid repeated import attempts
+_JIEBA_MODULE = None
+_JIEBA_IMPORT_FAILED = False
+
+
+def _get_jieba():
+    """Get jieba module with caching. Returns None if not available."""
+    global _JIEBA_MODULE, _JIEBA_IMPORT_FAILED
+    if _JIEBA_IMPORT_FAILED:
+        return None
+    if _JIEBA_MODULE is not None:
+        return _JIEBA_MODULE
+    try:
+        import jieba
+        _JIEBA_MODULE = jieba
+        return jieba
+    except ImportError:
+        _JIEBA_IMPORT_FAILED = True
+        return None
+
+
 # Default signal weights for weighted RRF
 # Optimized via grid search on personal memory benchmark (v0.4.1)
 # FTS is down-weighted relative to equal weighting to let vec/Jaccard help
@@ -167,7 +192,10 @@ class FactRetriever:
         If episode_id is provided, results are filtered to that episode.
         """
         # Stage 1: Get FTS5 candidates (more than limit for reranking headroom)
-        candidates = self._fts_candidates(query, category, min_trust, limit * 3, episode_id)
+        # Uses Chinese LIKE fallback when FTS5 returns 0 for Chinese queries
+        candidates = self._fts_candidates_with_chinese_fallback(
+            query, category, min_trust, limit * 3, episode_id
+        )
 
         # Stage 1b: Get vec candidates
         vec_candidates = self._vec_candidates(query, category, limit * 3, episode_id)
@@ -856,6 +884,157 @@ class FactRetriever:
             results.append(fact)
 
         return results
+
+    # ------------------------------------------------------------------
+    # Chinese language support
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _has_chinese(text: str) -> bool:
+        """Check if text contains Chinese characters (CJK Unified Ideographs).
+
+        Uses pre-compiled regex for hot-path efficiency (~0.01ms).
+        Returns False for empty/None input.
+        """
+        if not text:
+            return False
+        return bool(_RE_CHINESE.search(text))
+
+    @staticmethod
+    def _chinese_tokenize(text: str) -> list[str]:
+        """Tokenize Chinese text using jieba segmentation.
+
+        Falls back to character-level tokenization if jieba is unavailable.
+        Returns a list of meaningful tokens (filtered for length >= 2).
+        """
+        jieba_mod = _get_jieba()
+        if jieba_mod:
+            tokens = []
+            for word in jieba_mod.cut(text):
+                # Filter: keep words with >= 2 chars (skip single punctuation)
+                if len(word) >= 2:
+                    tokens.append(word)
+            return tokens
+
+        # Fallback: character-level tokenization
+        # Extract Chinese character sequences and bigrams
+        chars = _RE_CHINESE.findall(text)
+        tokens = list(set(chars))  # unique characters
+        # Add bigrams for phrase matching
+        for i in range(len(chars) - 1):
+            tokens.append(chars[i] + chars[i + 1])
+        return tokens
+
+    @staticmethod
+    def _escape_like(text: str) -> str:
+        """Escape special LIKE characters in a string for safe SQL LIKE usage."""
+        return text.replace('%', r'\%').replace('_', r'\_')
+
+    def _chinese_candidates(
+        self,
+        query: str,
+        category: str | None,
+        min_trust: float,
+        limit: int,
+        episode_id: int | None = None,
+    ) -> list[dict]:
+        """Get Chinese LIKE-based candidates from the store.
+
+        FTS5 unicode61 tokenizer tokenizes Chinese into single characters,
+        making keyword search completely ineffective. This method uses
+        LIKE-based pattern matching with jieba tokenization instead.
+
+        Returns list of fact dicts with 'fts_rank' field (for RRF fusion).
+        """
+        conn = self.store._conn
+
+        # Tokenize query using jieba
+        tokens = self._chinese_tokenize(query)
+        if not tokens:
+            return []
+
+        # Build LIKE query with AND semantics (must match all keywords)
+        like_clauses = []
+        params: list = []
+        for token in tokens:
+            like_clauses.append("(f.content LIKE ? OR f.tags LIKE ?)")
+            params.append(f"%{self._escape_like(token)}%")
+            params.append(f"%{self._escape_like(token)}%")
+
+        where_clauses = like_clauses
+        where_clauses.append("f.trust_score >= ?")
+        params.append(min_trust)
+
+        if category:
+            where_clauses.append("f.category = ?")
+            params.append(category)
+
+        if episode_id is not None:
+            where_clauses.append("ef.episode_id = ?")
+            params.append(episode_id)
+
+        where_sql = " AND ".join(where_clauses)
+        episode_join = "JOIN episode_facts ef ON ef.fact_id = f.fact_id" if episode_id is not None else ""
+
+        sql = f"""
+            SELECT f.*, 0 as fts_rank_raw
+            FROM facts f
+            {episode_join}
+            WHERE {where_sql}
+            LIMIT ?
+        """
+        params.append(limit * 3)
+
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        except Exception:
+            return []
+
+        if not rows:
+            return []
+
+        results = []
+        for rank, row in enumerate(rows, start=1):
+            fact = dict(row)
+            fact.pop("fts_rank_raw", None)
+            fact["fts_rank"] = rank  # Use rank order directly for Chinese LIKE
+            results.append(fact)
+
+        return results
+
+    def _fts_candidates_with_chinese_fallback(
+        self,
+        query: str,
+        category: str | None,
+        min_trust: float,
+        limit: int,
+        episode_id: int | None = None,
+    ) -> list[dict]:
+        """Get FTS5 candidates with Chinese LIKE fallback.
+
+        For Chinese queries, FTS5 unicode61 tokenizer produces single-character
+        tokens that are ineffective for keyword search. This method:
+        1. Tries FTS5 first (works for English, mixed queries)
+        2. Falls back to LIKE-based search if FTS5 returns 0 results for Chinese
+        3. Returns empty list for pure English (standard FTS5 path)
+
+        Returns list of fact dicts with 'fts_rank' field (for RRF fusion).
+        """
+        has_chinese = self._has_chinese(query)
+
+        if not has_chinese:
+            # Pure English: use standard FTS5 (unchanged path)
+            return self._fts_candidates(query, category, min_trust, limit, episode_id)
+
+        # Has Chinese: try FTS5 first, fall back to LIKE
+        fts_results = self._fts_candidates(query, category, min_trust, limit, episode_id)
+
+        if fts_results:
+            # FTS5 returned results — good enough (e.g., mixed EN+CN query)
+            return fts_results
+
+        # FTS5 returned 0 results — fall back to LIKE for Chinese
+        return self._chinese_candidates(query, category, min_trust, limit, episode_id)
 
     # ------------------------------------------------------------------
     # Evidence-gap analysis
