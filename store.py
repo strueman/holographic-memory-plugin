@@ -21,7 +21,7 @@ except ImportError:
     _HAS_SQLITE_VEC = False
 
 # Embedding config
-EMBEDDING_DIM = 384
+EMBEDDING_DIM = 1024
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -118,7 +118,7 @@ CREATE INDEX IF NOT EXISTS idx_episode_facts_fact ON episode_facts(fact_id);
 # Structural linking thresholds
 _HRR_LINK_THRESHOLD    = 0.55  # Normalized HRR sim; lowered from 0.65 for current corpus
 _ENTITY_LINK_THRESHOLD = 0.25  # Jaccard overlap on entity sets
-_EMB_LINK_THRESHOLD    = 0.70  # Cosine similarity for embeddings; lowered from 0.75
+_EMB_LINK_THRESHOLD    = 0.75  # Cosine similarity for embeddings; raised from 0.70 for bge-m3
 _LINK_COMPARE_LIMIT    = 100   # Max facts to compare against per new fact
 _LINKS_PER_FACT_MAX    = 20    # Max outgoing links per fact
 
@@ -260,13 +260,18 @@ class MemoryStore:
         self._conn.commit()
 
     def _init_vec0(self) -> None:
-        """Create vec0 virtual table for dense vector search if sqlite-vec is available."""
+        """Create vec0 virtual table for dense vector search if sqlite-vec is available.
+
+        Handles migration: if the table exists with a different dimension,
+        recreate it with the new dimension.
+        """
         global _HAS_SQLITE_VEC
         if not _HAS_SQLITE_VEC:
             return
         try:
             self._conn.enable_load_extension(True)
             sqlite_vec.load(self._conn)
+
             # Check if vec0 table already exists
             tables = [r["name"] for r in self._conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -278,6 +283,34 @@ class MemoryStore:
                     )
                 """)
                 self._conn.commit()
+            else:
+                # Check if dimension matches — if not, recreate the table.
+                # sqlite-vec vec0 tables enforce dimension at insert time.
+                # We detect a mismatch by attempting a test insert with the
+                # correct number of floats for the new dimension.
+                try:
+                    import struct
+                    zero_vec = struct.pack(f"<{EMBEDDING_DIM}f", *([0.0] * EMBEDDING_DIM))
+                    self._conn.execute(
+                        "INSERT INTO facts_vec(rowid, embedding) VALUES (-1, ?)",
+                        (zero_vec,),
+                    )
+                    self._conn.execute("DELETE FROM facts_vec WHERE rowid = -1")
+                    self._conn.commit()
+                except Exception:
+                    # Dimension mismatch — recreate the table
+                    import logging
+                    logging.getLogger(__name__).info(
+                        "Recreating facts_vec with new dimension %d (was different)",
+                        EMBEDDING_DIM,
+                    )
+                    self._conn.execute("DROP TABLE facts_vec")
+                    self._conn.execute(f"""
+                        CREATE VIRTUAL TABLE facts_vec USING vec0(
+                            embedding float[{EMBEDDING_DIM}]
+                        )
+                    """)
+                    self._conn.commit()
         except Exception as e:
             # sqlite-vec unavailable or failed — disable vector search globally.
             # This prevents _compute_embedding() from crashing on missing facts_vec table.

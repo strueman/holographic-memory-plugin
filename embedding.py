@@ -1,7 +1,10 @@
-"""Lightweight ONNX embedding model for fact vector search.
+"""BAAI bge-m3 INT8 ONNX embedding model for fact vector search.
 
-Uses all-MiniLM-L6-v2 via onnxruntime — no PyTorch dependency.
-384-dim embeddings, mean-pooled + L2-normalized.
+Uses BAAI/bge-m3 (1024-dim) via onnxruntime — no PyTorch dependency.
+INT8 quantized model for fast CPU inference.
+
+Supports 100+ languages including Chinese and English.
+Mean-pooled + L2-normalized embeddings.
 
 Model files are downloaded on first use and cached in the user's
 Hermes home directory.
@@ -22,9 +25,9 @@ _sess: InferenceSession | None = None
 _tok: Tokenizer | None = None
 _available: bool = False
 
-# Model download URLs
-_MODEL_URL = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
-_TOKENIZER_URL = "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
+# Model download URLs (Teradata INT8 ONNX export — better calibrated than Xenova)
+_MODEL_URL = "https://huggingface.co/Teradata/bge-m3/resolve/main/onnx/model_int8.onnx"
+_TOKENIZER_URL = "https://huggingface.co/Teradata/bge-m3/resolve/main/tokenizer.json"
 
 # Cache directory (Hermes home)
 def _get_cache_dir() -> Path:
@@ -35,10 +38,10 @@ def _get_cache_dir() -> Path:
         return Path.home() / ".hermes" / "holographic_embeddings"
 
 _CACHE_DIR = _get_cache_dir()
-_MODEL_PATH = _CACHE_DIR / "model.onnx"
-_TOKENIZER_PATH = _CACHE_DIR / "tokenizer.json"
+_MODEL_PATH = _CACHE_DIR / "bge-m3-int8.onnx"
+_TOKENIZER_PATH = _CACHE_DIR / "bge-m3-tokenizer.json"
 
-EMBEDDING_DIM = 384
+EMBEDDING_DIM = 1024
 
 
 def _download_file(url: str, dest: Path) -> bool:
@@ -91,7 +94,11 @@ def is_available() -> bool:
 
 
 def encode(text: str) -> np.ndarray:
-    """Encode a text string into a 384-dim L2-normalized embedding.
+    """Encode a text string into a 1024-dim L2-normalized embedding.
+
+    Uses bge-m3's pooling method: mean-pooling over token embeddings
+    with attention mask weighting. Includes the retrieval instruction
+    prefix required for proper bge-m3 embedding quality.
 
     Returns None if the model is unavailable.
     """
@@ -99,21 +106,23 @@ def encode(text: str) -> np.ndarray:
     if not _available or _sess is None or _tok is None:
         return None
 
-    encoded = _tok.encode(text)
+    # bge-m3 requires an instruction prefix for proper embeddings
+    # Without it, mean-pooled embeddings produce inflated similarities
+    text_with_instr = "Represent this sentence for searching relevant passages: " + text
+
+    encoded = _tok.encode(text_with_instr)
     seq_len = len(encoded.ids)
 
     input_ids = np.array([encoded.ids], dtype=np.int64)
     attention_mask = np.array([[1] * seq_len], dtype=np.int64)
-    token_type_ids = np.array([[0] * seq_len], dtype=np.int64)
 
     outputs = _sess.run(None, {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
-        "token_type_ids": token_type_ids,
     })
 
-    # Mean pooling over token embeddings
-    token_embeddings = outputs[0][0]  # (seq_len, 384)
+    # Mean pooling over token embeddings (bge-m3 uses last_hidden_state)
+    token_embeddings = outputs[0][0]  # (seq_len, 1024)
     mask = attention_mask[0]
     pooled = (token_embeddings * mask[:, np.newaxis]).sum(axis=0) / mask.sum()
 
