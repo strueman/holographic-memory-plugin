@@ -148,6 +148,29 @@ _RE_AKA          = re.compile(
     re.IGNORECASE,
 )
 
+# Chinese character detection (CJK Unified Ideographs)
+_RE_CHINESE = re.compile(r'[\u4e00-\u9fff]')
+
+# Cached jieba.posseg module for entity extraction
+_JIEBA_POS_MODULE = None
+_JIEBA_POS_IMPORT_FAILED = False
+
+
+def _get_jieba_posseg():
+    """Get jieba.posseg module with caching. Returns None if not available."""
+    global _JIEBA_POS_MODULE, _JIEBA_POS_IMPORT_FAILED
+    if _JIEBA_POS_IMPORT_FAILED:
+        return None
+    if _JIEBA_POS_MODULE is not None:
+        return _JIEBA_POS_MODULE
+    try:
+        import jieba.posseg as pseg
+        _JIEBA_POS_MODULE = pseg
+        return pseg
+    except ImportError:
+        _JIEBA_POS_IMPORT_FAILED = True
+        return None
+
 # ---------------------------------------------------------------------------
 # Ingestion sanitiser — strip framework-internal markup from fact content
 # before it hits the database.  Mirrors the regexes in memory_manager.py so
@@ -1121,6 +1144,55 @@ class MemoryStore:
     # Entity helpers
     # ------------------------------------------------------------------
 
+    def _has_chinese_entities(self, text: str) -> bool:
+        """Quick check if text contains Chinese characters."""
+        return bool(_RE_CHINESE.search(text))
+
+    def _extract_chinese_entities(self, text: str) -> list[str]:
+        """Extract Chinese entity candidates from text.
+
+        Uses jieba.posseg for POS tagging to identify:
+        - n (noun): common entities
+        - nr (person name): person names
+        - ns (location name): locations
+        - nt (organization name): organizations
+
+        Falls back to extracting Chinese character sequences if jieba unavailable.
+        Returns deduplicated list.
+        """
+        seen: set[str] = set()
+        candidates: list[str] = []
+
+        def _add(name: str) -> None:
+            stripped = name.strip()
+            if stripped and len(stripped) >= 2 and stripped.lower() not in seen:
+                seen.add(stripped.lower())
+                candidates.append(stripped)
+
+        pseg = _get_jieba_posseg()
+        if pseg:
+            # Use jieba POS tagging for proper Chinese entity recognition
+            for word, flag in pseg.cut(text):
+                if flag in ('nr', 'ns', 'nt', 'nz'):  # person, location, org, other proper noun
+                    _add(word)
+                elif flag == 'n' and len(word) >= 3:  # nouns with >= 3 chars
+                    _add(word)
+        else:
+            # Fallback: extract Chinese character sequences (2+ chars)
+            # Group consecutive Chinese characters
+            current_seq = ''
+            for ch in text:
+                if _RE_CHINESE.match(ch):
+                    current_seq += ch
+                else:
+                    if len(current_seq) >= 2:
+                        _add(current_seq)
+                    current_seq = ''
+            if len(current_seq) >= 2:
+                _add(current_seq)
+
+        return candidates
+
     def _extract_entities(self, text: str) -> list[str]:
         """Extract entity candidates from text using simple regex rules.
 
@@ -1153,6 +1225,11 @@ class MemoryStore:
         for m in _RE_AKA.finditer(text):
             _add(m.group(1))
             _add(m.group(2))
+
+        # Chinese entity extraction
+        if self._has_chinese_entities(text):
+            for entity in self._extract_chinese_entities(text):
+                _add(entity)
 
         return candidates
 
