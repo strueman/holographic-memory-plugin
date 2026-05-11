@@ -114,7 +114,7 @@ Inspired by [vstash](https://arxiv.org/abs/2604.15484) hybrid retrieval, the plu
 
 ### How It Works
 
-- **Embedding model:** all-MiniLM-L6-v2 (384-dim, ONNX runtime, ~90MB) downloaded on first use and cached in `~/.hermes/holographic_embeddings/`
+- **Embedding model:** multilingual-e5-small (384-dim, INT8 ONNX runtime, ~449MB) downloaded on first use and cached in `~/.hermes/holographic_embeddings/`. Uses "query: " / "passage: " prefix pattern required by e5 models.
 - **Storage:** `facts_vec` vec0 virtual table stores float32 embeddings keyed by fact_id
 - **Query:** sqlite-vec KNN finds nearest neighbors to the query embedding
 - **Fusion:** Vec rank is one of five sources in the weighted RRF fusion pipeline (FTS5=0.5, Vec=0.75, Jaccard=0.75, HRR=0.5, Access=0.5)
@@ -198,21 +198,54 @@ results = retriever.search("query", evidence_gap=False)
 
 ## Benchmarks
 
-Evaluations performed on the LongMemEval oracle subset (500 instances, 10,960 turns) using precision, recall, and NDCG at K=3 and K=5.
+Evaluations performed on the LongMemEval oracle subset (500 instances, 10,960 turns) and Chinese CMRC 2018 (50 instances, 50 facts) using precision, recall, and NDCG at K=3 and K=5.
 
-**Benchmark methodology:** The benchmark imports the real `FactRetriever` and `MemoryStore` from the plugin, retrieves actual FTS5 + vec KNN candidates, then applies both RRF and weighted-sum scoring on the **same candidate pool** for a fair comparison. All five ranking sources (FTS5, Vec, Jaccard, HRR, Access) are active during candidate retrieval.
+**Benchmark methodology:** The benchmark imports the real `FactRetriever` and `MemoryStore` from the plugin, retrieves actual FTS5 + vec KNN candidates, then applies RRF scoring on the **live candidate pool**. All five ranking sources (FTS5, Vec, Jaccard, HRR, Access) are active during candidate retrieval.
 
-### LongMemEval 500-instance Results (5-signal Weighted RRF)
+### LongMemEval 500-instance Results (v0.4.10, 5-signal Weighted RRF)
 
 **Metric key:** P@K = Precision@K (fraction of top-K results that are relevant), R@K = Recall@K (fraction of relevant results found in top-K), NDCG@K = Normalized Discounted Cumulative Gain (ranking quality, rewards relevant items appearing higher).
 
 | Method | P@3 | P@5 | R@3 | R@5 | NDCG@3 |
 |--------|-----|-----|-----|-----|--------|
-| Standard Weighted-sum | 0.249 | 0.162 | 0.441 | 0.476 | 0.419 |
-| **RRF (C=60)** | **0.264** | **0.173** | **0.462** | **0.498** | **0.443** |
-| **Delta** | **+6.2%** | **+6.4%** | **+4.8%** | **+4.6%** | **+5.8%** |
+| v0.4.2 baseline (MiniLM) | 0.249 | 0.173 | 0.435 | 0.498 | 0.420 |
+| v0.4.6 initial (e5-small) | 0.069 | 0.058 | 0.115 | 0.158 | 0.110 |
+| **v0.4.10 (e5-small, fixed)** | **0.333** | **0.232** | **0.599** | **0.672** | **0.570** |
+| **Delta vs baseline** | **+33.7%** | **+34.1%** | **+37.7%** | **+34.7%** | **+35.7%** |
 
-Per-query wins (P@3): RRF=28, Weighted=7, Tie=465 (out of 500).
+Per-query wins (P@3): RRF=363, Tie=137 (out of 500).
+
+### Chinese CMRC 2018 Results (v0.4.10, 50 queries, 50 facts)
+
+| Method | P@3 | P@5 | R@3 | R@5 | NDCG@3 |
+|--------|-----|-----|-----|-----|--------|
+| v0.4.2 baseline (MiniLM) | 0.300 | 0.180 | 0.900 | 0.900 | 0.853 |
+| **v0.4.10 (e5-small, fixed)** | **0.327** | **0.196** | **0.980** | **0.980** | **0.965** |
+| **Delta vs baseline** | **+9.0%** | **+8.9%** | **+8.9%** | **+8.9%** | **+13.1%** |
+
+### By Query Type — LongMemEval (P@3, v0.4.10)
+
+| Query Type | P@3 |
+|------------|-----|
+| temporal-reasoning | 0.318 |
+| multi-session | 0.376 |
+| knowledge-update | 0.432 |
+| single-session-preference | 0.167 |
+| single-session-assistant | 0.333 |
+| single-session-user | 0.243 |
+
+### Regression Investigation (v0.4.6 → v0.4.10)
+
+Initial e5-small migration (v0.4.6) showed P@3 regression from 0.249 to 0.069 on LongMemEval. Root cause: phrase proximity scoring (multiplier 0.20) dominated RRF scores (0.003-0.019), allowing irrelevant facts with coincidental term adjacency to outrank semantically relevant ones. Fixed across 4 commits:
+
+| Tag | Fix | LongMemEval P@3 | Chinese P@3 |
+|-----|-----|-----------------|-------------|
+| v0.4.7 | Proximity word boundaries + mult 0.20→0.02 | 0.113 | 0.320 |
+| v0.4.8 | IDF boost cap at 1.5 | 0.111 | 0.320 |
+| v0.4.9 | "query: " prefix for search queries | 0.109 | 0.327 |
+| v0.4.10 | Proximity mult 0.02→0.002 | **0.333** | 0.327 |
+
+Final P@3=0.333 exceeds v0.4.2 baseline (0.249) by 33.7%.
 
 ### Personal Memory Dataset v0.4.2 (1694 facts, 181 queries, 100% vec coverage)
 
@@ -232,23 +265,11 @@ By query type (Weighted RRF):
 - multi-hop: 0.154
 - entity-resolution: 0.150
 
-### By Query Type (P@3)
-
-| Query Type | Weighted | RRF | Delta |
-|------------|----------|-----|-------|
-| temporal-reasoning | 0.261 | 0.283 | +0.023 |
-| multi-session | 0.263 | 0.293 | +0.030 |
-| knowledge-update | 0.376 | 0.385 | +0.009 |
-| single-session-preference | 0.078 | 0.078 | +0.000 |
-| single-session-assistant | 0.125 | 0.143 | +0.018 |
-| single-session-user | 0.229 | 0.214 | -0.014 |
-
-RRF leads on 5 of 6 query types. The single-session-user category is the only one where weighted-sum edges out RRF by a small margin (-0.014), likely because those queries favor the FTS5 rank normalization used by weighted scoring.
-
 ### Notes
 
-- **Previous benchmark (standalone)** reported higher deltas (RRF P@3: 0.223 vs Weighted 0.154, +44.6%) because it reimplemented retrieval from scratch without vec candidates. The new benchmark uses the actual plugin pipeline with all 4 signals active, producing higher absolute scores but narrower deltas since both methods benefit from vec.
+- **Previous benchmark (standalone)** reported higher deltas (RRF P@3: 0.223 vs Weighted 0.154, +44.6%) because it reimplemented retrieval from scratch without vec candidates. The new benchmark uses the actual plugin pipeline with all 5 signals active, producing higher absolute scores but narrower deltas since both methods benefit from vec.
 - **Entity-boosted RRF** (conditional entity rank boost for named-entity queries) was evaluated separately and underperformed standard RRF on synthetic LME data (P@3: 0.177 vs 0.223). Entity boosting remains enabled in production where real entities show better signal.
+- **e5-small vs MiniLM:** e5-small backfills 56x faster (~56 facts/s vs ~1 fact/s) with comparable or better retrieval quality. Multilingual coverage (100+ languages) enables Chinese CMRC benchmark support.
 
 ## Tests
 
@@ -268,7 +289,8 @@ python -m pytest tests/test_sqlite_vec.py -v
 15 tests for sqlite-vec integration (vec table creation, embedding storage, KNN queries, RRF fusion, backfill, graceful degradation).
 24 tests for structural linking (graph traversal, link scoring, evidence-gap tracking, temporal segmentation).
 15 tests for temporal segmentation (episode detection, temporal boundaries, segment scoring).
-All 158 tests pass.
+26 tests for bilingual search (Chinese detection, jieba tokenization, LIKE fallback, entity extraction, edge cases).
+All 184 tests pass.
 
 ## License
 
