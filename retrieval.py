@@ -302,7 +302,7 @@ class FactRetriever:
                 proximity_score = self._phrase_proximity(query, fact["content"], proximity_terms)
 
             # Combine RRF + proximity
-            score = rrf_score * fact["trust_score"] + proximity_score * 0.02
+            score = rrf_score * fact["trust_score"] + proximity_score * 0.002
 
             # Optional temporal decay
             if self.half_life > 0:
