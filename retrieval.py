@@ -300,7 +300,7 @@ class FactRetriever:
                 proximity_score = self._phrase_proximity(query, fact["content"], proximity_terms)
 
             # Combine RRF + proximity
-            score = rrf_score * fact["trust_score"] + proximity_score * 0.20
+            score = rrf_score * fact["trust_score"] + proximity_score * 0.02
 
             # Optional temporal decay
             if self.half_life > 0:
@@ -1243,6 +1243,14 @@ class FactRetriever:
                 idx = content_lower.find(term, start)
                 if idx == -1:
                     break
+                # Word boundary check: ensure term isn't part of a larger word
+                if idx > 0 and content_lower[idx - 1].isalnum():
+                    start = idx + 1
+                    continue
+                end = idx + len(term)
+                if end < len(content_lower) and content_lower[end].isalnum():
+                    start = idx + 1
+                    continue
                 positions.append(idx)
                 start = idx + 1
 
