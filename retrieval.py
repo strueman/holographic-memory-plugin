@@ -142,12 +142,13 @@ class FactRetriever:
     def _query_idf(self, query: str) -> float:
         """Compute average IDF for meaningful query terms.
 
-        Returns a boost factor in [1.0, ~2.5]. A query with only common terms
+        Returns a boost factor in [1.0, 1.5]. A query with only common terms
         (low IDF) returns ~1.0 (no boost). A query with rare terms (high IDF)
         returns a larger boost.
 
         This amplifies the FTS5 contribution for queries that contain rare,
-        discriminative terms.
+        discriminative terms. Capped at 1.5 to prevent FTS5 from dominating
+        vec in large corpora where even common terms have high IDF.
         """
         if not self._idf_computed or not self._idf_cache:
             return 1.0
@@ -164,7 +165,8 @@ class FactRetriever:
 
         avg_idf = sum(idf_values) / len(idf_values)
         # Dampen: 1 + log(1 + avg_idf) gives [1.0, ~2.3] for typical corpora
-        return 1.0 + math.log(1.0 + avg_idf)
+        # Cap at 1.5 to prevent FTS5 from overwhelming vec in large corpora
+        return min(1.5, 1.0 + math.log(1.0 + avg_idf))
 
     def search(
         self,
