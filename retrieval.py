@@ -721,8 +721,8 @@ class FactRetriever:
         if not emb_mod.is_available():
             return []
 
-        # Encode query
-        query_vec = emb_mod.encode(query)
+        # Encode query with "query:" prefix required by e5 models
+        query_vec = emb_mod.encode(query, prefix="query")
         if query_vec is None:
             return []
 

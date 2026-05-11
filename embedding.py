@@ -97,11 +97,13 @@ def is_available() -> bool:
 _MAX_TOKENS = 512  # e5-small max position embeddings
 
 
-def encode(text: str) -> np.ndarray:
+def encode(text: str, prefix: str = "passage") -> np.ndarray:
     """Encode a text string into a 384-dim L2-normalized embedding.
 
     Uses multilingual-e5-small's pre-pooled sentence embedding output.
-    Includes the "passage: " prefix required for proper e5 embedding quality.
+    Requires the correct prefix for proper e5 embedding quality:
+    - "passage" (default) for documents/facts
+    - "query" for search queries
 
     The Teradata INT8 ONNX export already handles mean-pooling and returns
     a [batch, 384] sentence_embedding output directly.
@@ -115,8 +117,7 @@ def encode(text: str) -> np.ndarray:
         return None
 
     # e5 models require a prefix for proper embeddings
-    # "passage: " for documents/facts, "query: " for search queries
-    text_with_prefix = "passage: " + text
+    text_with_prefix = f"{prefix}: " + text
 
     encoded = _tok.encode(text_with_prefix)
     # Truncate to model's max position embeddings
