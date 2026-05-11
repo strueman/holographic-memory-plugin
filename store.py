@@ -21,7 +21,7 @@ except ImportError:
     _HAS_SQLITE_VEC = False
 
 # Embedding config
-EMBEDDING_DIM = 1024
+EMBEDDING_DIM = 384
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -118,7 +118,7 @@ CREATE INDEX IF NOT EXISTS idx_episode_facts_fact ON episode_facts(fact_id);
 # Structural linking thresholds
 _HRR_LINK_THRESHOLD    = 0.55  # Normalized HRR sim; lowered from 0.65 for current corpus
 _ENTITY_LINK_THRESHOLD = 0.25  # Jaccard overlap on entity sets
-_EMB_LINK_THRESHOLD    = 0.75  # Cosine similarity for embeddings; raised from 0.70 for bge-m3
+_EMB_LINK_THRESHOLD    = 0.80  # Cosine similarity for embeddings; raised from 0.75 for multilingual-e5-small
 _LINK_COMPARE_LIMIT    = 100   # Max facts to compare against per new fact
 _LINKS_PER_FACT_MAX    = 20    # Max outgoing links per fact
 

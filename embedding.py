@@ -1,10 +1,11 @@
-"""BAAI bge-m3 INT8 ONNX embedding model for fact vector search.
+"""intfloat/multilingual-e5-small INT8 ONNX embedding model for fact vector search.
 
-Uses BAAI/bge-m3 (1024-dim) via onnxruntime — no PyTorch dependency.
+Uses multilingual-e5-small (384-dim) via onnxruntime — no PyTorch dependency.
 INT8 quantized model for fast CPU inference.
 
-Supports 100+ languages including Chinese and English.
-Mean-pooled + L2-normalized embeddings.
+Supports 100 languages including Chinese and English.
+
+Uses "query: " / "passage: " prefix pattern required by e5 models.
 
 Model files are downloaded on first use and cached in the user's
 Hermes home directory.
@@ -25,9 +26,9 @@ _sess: InferenceSession | None = None
 _tok: Tokenizer | None = None
 _available: bool = False
 
-# Model download URLs (Teradata INT8 ONNX export — better calibrated than Xenova)
-_MODEL_URL = "https://huggingface.co/Teradata/bge-m3/resolve/main/onnx/model_int8.onnx"
-_TOKENIZER_URL = "https://huggingface.co/Teradata/bge-m3/resolve/main/tokenizer.json"
+# Model download URLs (Teradata INT8 ONNX export — pre-pooled sentence embeddings)
+_MODEL_URL = "https://huggingface.co/Teradata/multilingual-e5-small/resolve/main/onnx/model.onnx"
+_TOKENIZER_URL = "https://huggingface.co/intfloat/multilingual-e5-small/resolve/main/tokenizer.json"
 
 # Cache directory (Hermes home)
 def _get_cache_dir() -> Path:
@@ -38,10 +39,10 @@ def _get_cache_dir() -> Path:
         return Path.home() / ".hermes" / "holographic_embeddings"
 
 _CACHE_DIR = _get_cache_dir()
-_MODEL_PATH = _CACHE_DIR / "bge-m3-int8.onnx"
-_TOKENIZER_PATH = _CACHE_DIR / "bge-m3-tokenizer.json"
+_MODEL_PATH = _CACHE_DIR / "multilingual-e5-small-int8.onnx"
+_TOKENIZER_PATH = _CACHE_DIR / "multilingual-e5-small-tokenizer.json"
 
-EMBEDDING_DIM = 1024
+EMBEDDING_DIM = 384
 
 
 def _download_file(url: str, dest: Path) -> bool:
@@ -93,45 +94,61 @@ def is_available() -> bool:
     return _available
 
 
+_MAX_TOKENS = 512  # e5-small max position embeddings
+
+
 def encode(text: str) -> np.ndarray:
-    """Encode a text string into a 1024-dim L2-normalized embedding.
+    """Encode a text string into a 384-dim L2-normalized embedding.
 
-    Uses bge-m3's pooling method: mean-pooling over token embeddings
-    with attention mask weighting. Includes the retrieval instruction
-    prefix required for proper bge-m3 embedding quality.
+    Uses multilingual-e5-small's pre-pooled sentence embedding output.
+    Includes the "passage: " prefix required for proper e5 embedding quality.
 
-    Returns None if the model is unavailable.
+    The Teradata INT8 ONNX export already handles mean-pooling and returns
+    a [batch, 384] sentence_embedding output directly.
+
+    Long inputs are truncated to _MAX_TOKENS to avoid ONNX runtime errors.
+
+    Returns None if the model is unavailable or encoding fails.
     """
     _load()
     if not _available or _sess is None or _tok is None:
         return None
 
-    # bge-m3 requires an instruction prefix for proper embeddings
-    # Without it, mean-pooled embeddings produce inflated similarities
-    text_with_instr = "Represent this sentence for searching relevant passages: " + text
+    # e5 models require a prefix for proper embeddings
+    # "passage: " for documents/facts, "query: " for search queries
+    text_with_prefix = "passage: " + text
 
-    encoded = _tok.encode(text_with_instr)
-    seq_len = len(encoded.ids)
+    encoded = _tok.encode(text_with_prefix)
+    # Truncate to model's max position embeddings
+    ids = encoded.ids[:_MAX_TOKENS]
+    seq_len = len(ids)
 
-    input_ids = np.array([encoded.ids], dtype=np.int64)
+    # Safety: ensure we don't exceed model limits
+    if seq_len == 0:
+        return None
+
+    # Teradata ONNX model expects 2D input (batch_size, seq_len), not 3D
+    input_ids = np.array([encoded.ids[:seq_len]], dtype=np.int64)
     attention_mask = np.array([[1] * seq_len], dtype=np.int64)
 
-    outputs = _sess.run(None, {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-    })
+    try:
+        outputs = _sess.run(None, {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        })
+    except Exception:
+        return None
 
-    # Mean pooling over token embeddings (bge-m3 uses last_hidden_state)
-    token_embeddings = outputs[0][0]  # (seq_len, 1024)
-    mask = attention_mask[0]
-    pooled = (token_embeddings * mask[:, np.newaxis]).sum(axis=0) / mask.sum()
+    # The Teradata model outputs: [token_embeddings, sentence_embedding]
+    # sentence_embedding is already mean-pooled and 384-dim
+    sentence_emb = outputs[1]  # (1, 384)
 
     # L2 normalize
-    norm = np.linalg.norm(pooled)
+    norm = np.linalg.norm(sentence_emb)
     if norm > 0:
-        pooled = pooled / norm
+        sentence_emb = sentence_emb / norm
 
-    return pooled.astype(np.float32)
+    return sentence_emb[0].astype(np.float32)  # Return (384,) not (1, 384)
 
 
 def encode_batch(texts: list[str]) -> list[np.ndarray | None]:

@@ -5,7 +5,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="holographic-memory-plugin",
-    version="0.4.0",
+    version="0.4.6",
     description="Holographic memory plugin for Hermes Agent — SQLite-backed fact storage with entity resolution, trust scoring, HRR vectors, and RRF retrieval.",
     author="Simon (strueman)",
     python_requires=">=3.11",
