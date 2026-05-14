@@ -7,7 +7,7 @@ import sqlite3
 import numpy as np
 from pathlib import Path
 
-sys.path.insert(0, str(Path.home() / ".hermes" / "hermes-agent" / "plugins" / "memory" / "holographic"))
+sys.path.insert(0, str(Path.home() / ".hermes" / "hermes-agent" / "plugins" / "memory" / "mnemoss"))
 
 from store import MemoryStore
 from retrieval import FactRetriever
