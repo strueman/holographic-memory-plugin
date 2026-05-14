@@ -15,9 +15,9 @@ if TYPE_CHECKING:
     from .store import MemoryStore
 
 try:
-    from . import holographic as hrr
+    from . import hrr
 except ImportError:
-    import holographic as hrr  # type: ignore[no-redef]
+    import hrr  # type: ignore[no-redef]
 
 # RRF constant — exposed for testing
 _RRF_C = 60

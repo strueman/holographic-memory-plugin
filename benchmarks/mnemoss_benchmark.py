@@ -1,18 +1,18 @@
-"""Holographic memory benchmark: RRF vs weighted-sum.
+"""Mnemoss benchmark: RRF vs weighted-sum.
 
 Uses the real retrieval pipeline (retrieval.py) for candidate generation
 and scoring — no more standalone reimplementations.
 
 Usage:
-    python holographic_benchmark.py                    # run all benchmarks
-    python holographic_benchmark.py --limit 3          # top-3 results only
-    python holographic_benchmark.py --method both      # compare both (default)
-    python holographic_benchmark.py --method rrf       # RRF only
-    python holographic_benchmark.py --method weighted  # weighted-sum only
-    python holographic_benchmark.py --queries "exact"  # run specific query types
-    python holographic_benchmark.py --longmemeval      # use LongMemEval oracle dataset
-    python holographic_benchmark.py --longmemeval --subset 50  # first 50 LME instances
-    python holographic_benchmark.py --live             # test live FactRetriever.search()
+    python mnemoss_benchmark.py                    # run all benchmarks
+    python mnemoss_benchmark.py --limit 3          # top-3 results only
+    python mnemoss_benchmark.py --method both      # compare both (default)
+    python mnemoss_benchmark.py --method rrf       # RRF only
+    python mnemoss_benchmark.py --method weighted  # weighted-sum only
+    python mnemoss_benchmark.py --queries "exact"  # run specific query types
+    python mnemoss_benchmark.py --longmemeval      # use LongMemEval oracle dataset
+    python mnemoss_benchmark.py --longmemeval --subset 50  # first 50 LME instances
+    python mnemoss_benchmark.py --live             # test live FactRetriever.search()
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ DEFAULT_DB = Path.home() / ".hermes" / "memory_store.db"
 # Plugin imports (real pipeline)
 # ---------------------------------------------------------------------------
 
-_PLUGIN_DIR = Path.home() / ".hermes" / "hermes-agent" / "plugins" / "memory" / "holographic"
+_PLUGIN_DIR = Path.home() / ".hermes" / "hermes-agent" / "plugins" / "memory" / "mnemoss"
 sys.path.insert(0, str(_PLUGIN_DIR))
 
 try:
@@ -480,7 +480,7 @@ def run_benchmark(
         return []
 
     if not HAS_PLUGIN:
-        print(f"Error: holographic plugin not available: {_IMPORT_ERR}")
+        print(f"Error: Mnemoss plugin not available: {_IMPORT_ERR}")
         print("  Make sure the plugin is installed at:", _PLUGIN_DIR)
         return []
 
@@ -633,7 +633,7 @@ def print_results(results: List[QueryResult]):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Holographic memory benchmark")
+    parser = argparse.ArgumentParser(description="Mnemoss benchmark")
     parser.add_argument("--db", type=str, default=str(DEFAULT_DB), help="Path to SQLite DB")
     parser.add_argument("--method", choices=["both", "rrf", "weighted"], default="both")
     parser.add_argument("--limit", type=int, default=10, help="Top-K results")

@@ -1,4 +1,4 @@
-"""hermes-memory-store — holographic memory plugin using MemoryProvider interface.
+"""mnemoss — Mnemoss memory plugin using MemoryProvider interface.
 
 Registers as a MemoryProvider plugin, giving the agent structured fact storage
 with entity resolution, trust scoring, and HRR-based compositional retrieval.
@@ -7,7 +7,7 @@ Original plugin by dusterbloom (PR #2351), adapted to the MemoryProvider ABC.
 
 Config in $HERMES_HOME/config.yaml (profile-scoped):
   plugins:
-    hermes-memory-store:
+    mnemoss:
       db_path: $HERMES_HOME/memory_store.db   # omit to use the default
       auto_extract: false
       default_trust: 0.5
@@ -22,7 +22,7 @@ import logging
 import re
 from typing import Any, Dict, List
 
-__version__ = "0.4.6"
+__version__ = "0.4.10"
 
 # Graceful imports — these aren't available in the standalone test environment.
 # When running tests from the plugin repo, the hermes-agent internals don't exist.
@@ -157,7 +157,7 @@ def _load_plugin_config() -> dict:
         import yaml
         with open(config_path) as f:
             all_config = yaml.safe_load(f) or {}
-        return cfg_get(all_config, "plugins", "hermes-memory-store", default={}) or {}
+        return cfg_get(all_config, "plugins", "mnemoss", default={}) or {}
     except Exception:
         return {}
 
@@ -166,8 +166,8 @@ def _load_plugin_config() -> dict:
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
-class HolographicMemoryProvider(MemoryProvider):
-    """Holographic memory with structured facts, entity resolution, and HRR retrieval."""
+class MnemossMemoryProvider(MemoryProvider):
+    """Mnemoss memory with structured facts, entity resolution, and HRR retrieval."""
 
     def __init__(self, config: dict | None = None):
         self._config = config or _load_plugin_config()
@@ -177,13 +177,13 @@ class HolographicMemoryProvider(MemoryProvider):
 
     @property
     def name(self) -> str:
-        return "holographic"
+        return "mnemoss"
 
     def is_available(self) -> bool:
         return True  # SQLite is always available, numpy is optional
 
     def save_config(self, values, hermes_home):
-        """Write config to config.yaml under plugins.hermes-memory-store."""
+        """Write config to config.yaml under plugins.mnemoss."""
         from pathlib import Path
         config_path = Path(hermes_home) / "config.yaml"
         try:
@@ -193,7 +193,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 with open(config_path) as f:
                     existing = yaml.safe_load(f) or {}
             existing.setdefault("plugins", {})
-            existing["plugins"]["hermes-memory-store"] = values
+            existing["plugins"]["mnemoss"] = values
             with open(config_path, "w") as f:
                 yaml.dump(existing, f, default_flow_style=False)
         except Exception:
@@ -243,13 +243,13 @@ class HolographicMemoryProvider(MemoryProvider):
             total = 0
         if total == 0:
             return (
-                "# Holographic Memory\n"
+                "# Mnemoss Memory\n"
                 "Active. Empty fact store — proactively add facts the user would expect you to remember.\n"
                 "Use fact_store(action='add') to store durable structured facts about people, projects, preferences, decisions.\n"
                 "Use fact_feedback to rate facts after using them (trains trust scores)."
             )
         return (
-            f"# Holographic Memory\n"
+            f"# Mnemoss Memory\n"
             f"Active. {total} facts stored with entity resolution and trust scoring.\n"
             f"Use fact_store to search, probe entities, reason across entities, or add facts.\n"
             f"Use fact_feedback to rate facts after using them (trains trust scores)."
@@ -266,13 +266,13 @@ class HolographicMemoryProvider(MemoryProvider):
             for r in results:
                 trust = r.get("trust_score", r.get("trust", 0))
                 lines.append(f"- [{trust:.1f}] {r.get('content', '')}")
-            return "## Holographic Memory\n" + "\n".join(lines)
+            return "## Mnemoss Memory\n" + "\n".join(lines)
         except Exception as e:
-            logger.debug("Holographic prefetch failed: %s", e)
+            logger.debug("Mnemoss prefetch failed: %s", e)
             return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        # Holographic memory stores explicit facts via tools, not auto-sync.
+        # Mnemoss stores explicit facts via tools, not auto-sync.
         # The on_session_end hook handles auto-extraction if configured.
         pass
 
@@ -300,7 +300,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 category = "user_pref" if target == "user" else "general"
                 self._store.add_fact(content, category=category)
             except Exception as e:
-                logger.debug("Holographic memory_write mirror failed: %s", e)
+                logger.debug("Mnemoss memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
         self._store = None
@@ -495,9 +495,9 @@ class HolographicMemoryProvider(MemoryProvider):
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
 def register(ctx) -> None:
-    """Register the holographic memory provider with the plugin system."""
+    """Register the Mnemoss memory provider with the plugin system."""
     config = _load_plugin_config()
-    provider = HolographicMemoryProvider(config=config)
+    provider = MnemossMemoryProvider(config=config)
     ctx.register_memory_provider(provider)

@@ -10,9 +10,9 @@ from datetime import datetime
 from pathlib import Path
 
 try:
-    from . import holographic as hrr
+    from . import hrr
 except ImportError:
-    import holographic as hrr  # type: ignore[no-redef]
+    import hrr  # type: ignore[no-redef]
 
 try:
     import sqlite_vec

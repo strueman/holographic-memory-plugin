@@ -37,7 +37,7 @@ _TWO_PI = 2.0 * math.pi
 
 def _require_numpy() -> None:
     if not _HAS_NUMPY:
-        raise RuntimeError("numpy is required for holographic operations")
+        raise RuntimeError("numpy is required for HRR operations")
 
 
 def encode_atom(word: str, dim: int = 1024) -> "np.ndarray":

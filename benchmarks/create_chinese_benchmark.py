@@ -26,7 +26,7 @@ except ImportError:
 DATASET_URL = "https://storage.googleapis.com/cluebenchmark/tasks/cmrc2018_public.zip"
 DEFAULT_DB = Path(__file__).parent / "chinese_cmrc2018.db"
 
-# Schema matching the holographic memory store (simplified for benchmark)
+# Schema matching the Mnemoss store (simplified for benchmark)
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
     fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -235,7 +235,7 @@ def main():
 
     print(f"{'=' * 50}")
     print(f"\nNext: backfill embeddings and HRR vectors")
-    print(f"  cd ~/.hermes/holographic-memory-plugin")
+    print(f"  cd ~/.hermes/mnemoss")
     print(f"  python3 -c \"\"\"")
     print(f"  from store import MemoryStore")
     print(f"  store = MemoryStore('{db_path}')")

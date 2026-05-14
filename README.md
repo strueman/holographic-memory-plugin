@@ -1,10 +1,10 @@
-# Holographic Memory Plugin
+# Mnemoss
 
-A lightweight, single-user memory plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) using **Holographic Reduced Representation (HRR)** vectors for compositional reasoning, backed by SQLite with FTS5 full-text search, sqlite-vec dense vector search, and Reciprocal Rank Fusion (RRF) retrieval.
+A lightweight memory system for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — symbiotically combining algorithmic speed with LLM reasoning. Built on **Holographic Reduced Representation (HRR)** vectors for compositional reasoning, backed by SQLite with FTS5 full-text search, sqlite-vec dense vector search, and Reciprocal Rank Fusion (RRF) retrieval.
 
 > **Attribution:** Original plugin by [dusterbloom](https://github.com/dusterbloom) (PR [#2351](https://github.com/NousResearch/hermes-agent/pull/2351)), adapted to the `MemoryProvider` ABC.
 
-> **Multilingual roadmap:** Three-layer approach for multilingual support — (1) **Query expansion** via Cygnet (multi-language WordNet), (2) **Search routing** (PR #1: language-aware routing, English→FTS5, Chinese→jieba), (3) **Cross-encoder reranking** (language-agnostic). See [roadmap](https://github.com/strueman/holographic-memory-plugin/blob/main/summaries/holographic-query-expansion-and-reranking-roadmap-2026.md).
+> **Multilingual roadmap:** Three-layer approach for multilingual support — (1) **Query expansion** via Cygnet (multi-language WordNet), (2) **Search routing** (PR #1: language-aware routing, English→FTS5, Chinese→jieba), (3) **Cross-encoder reranking** (language-agnostic). See [roadmap](https://github.com/strueman/mnemoss/blob/main/summaries/holographic-query-expansion-and-reranking-roadmap-2026.md).
 
 ## Features
 
@@ -30,10 +30,10 @@ A lightweight, single-user memory plugin for [Hermes Agent](https://github.com/N
 
 ## Installation
 
-Drop the `holographic` directory into your Hermes Agent plugin path:
+Drop the `mnemoss` directory into your Hermes Agent plugin path:
 
 ```bash
-cp -r holographic ~/.hermes/hermes-agent/plugins/memory/holographic
+cp -r mnemoss ~/.hermes/hermes-agent/plugins/memory/mnemoss
 ```
 
 ## Architecture
@@ -83,8 +83,8 @@ The `FactRetriever.search()` method uses a multi-stage pipeline with four rankin
 
 | Type | Method | Description |
 |------|--------|-------------|
-| **Holographic probe** | `probe(entity)` | Unbinds entity from memory banks to find associated facts |
-| **Holographic related** | `related(entity)` | Finds facts sharing structural connections with an entity |
+| **HRR probe** | `probe(entity)` | Unbinds entity from memory banks to find associated facts |
+| **HRR related** | `related(entity)` | Finds facts sharing structural connections with an entity |
 | **Multi-entity reason** | `reason([e1, e2, ...])` | Vector-space JOIN across multiple entities (AND semantics) |
 | **Contradiction check** | `contradict()` | Finds facts with high entity overlap but low content similarity |
 | **FTS5 search** | `search(query)` | Full-text keyword search with entity-boosted RRF fusion |
@@ -114,7 +114,7 @@ Inspired by [vstash](https://arxiv.org/abs/2604.15484) hybrid retrieval, the plu
 
 ### How It Works
 
-- **Embedding model:** multilingual-e5-small (384-dim, INT8 ONNX runtime, ~449MB) downloaded on first use and cached in `~/.hermes/holographic_embeddings/`. Uses "query: " / "passage: " prefix pattern required by e5 models.
+- **Embedding model:** multilingual-e5-small (384-dim, INT8 ONNX runtime, ~449MB) downloaded on first use and cached in `~/.hermes/mnemoss_embeddings/`. Uses "query: " / "passage: " prefix pattern required by e5 models.
 - **Storage:** `facts_vec` vec0 virtual table stores float32 embeddings keyed by fact_id
 - **Query:** sqlite-vec KNN finds nearest neighbors to the query embedding
 - **Fusion:** Vec rank is one of five sources in the weighted RRF fusion pipeline (FTS5=0.5, Vec=0.75, Jaccard=0.75, HRR=0.5, Access=0.5)
@@ -275,10 +275,10 @@ By query type (Weighted RRF):
 
 ```bash
 # RRF tests
-python -m pytest tests/plugins/memory/test_holographic_rrf.py -v
+python -m pytest tests/test_mnemoss_rrf.py -v
 
 # Evidence-gap tracker tests
-python -m pytest tests/plugins/memory/test_evidence_gap.py -v
+python -m pytest tests/test_mnemoss_rrf.py -v
 
 # Dense vector search tests
 python -m pytest tests/test_sqlite_vec.py -v

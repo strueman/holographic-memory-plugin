@@ -34,9 +34,9 @@ _TOKENIZER_URL = "https://huggingface.co/intfloat/multilingual-e5-small/resolve/
 def _get_cache_dir() -> Path:
     try:
         from hermes_constants import get_hermes_home
-        return Path(get_hermes_home()) / "holographic_embeddings"
+        return Path(get_hermes_home()) / "mnemoss_embeddings"
     except ImportError:
-        return Path.home() / ".hermes" / "holographic_embeddings"
+        return Path.home() / ".hermes" / "mnemoss_embeddings"
 
 _CACHE_DIR = _get_cache_dir()
 _MODEL_PATH = _CACHE_DIR / "multilingual-e5-small-int8.onnx"

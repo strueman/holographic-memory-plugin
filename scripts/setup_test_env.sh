@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup_test_env.sh — Bootstrap a standalone test environment for the holographic memory plugin.
+# setup_test_env.sh — Bootstrap a standalone test environment for the Mnemoss.
 #
 # Usage:
 #   ./scripts/setup_test_env.sh [--venv .venv] [--system]

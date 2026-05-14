@@ -1,4 +1,4 @@
-"""Pytest configuration for holographic-memory-plugin.
+"""Pytest configuration for Mnemoss.
 
 The root __init__.py imports from hermes-agent internals (agent.memory_provider)
 which aren't available when running tests from the standalone plugin repo.

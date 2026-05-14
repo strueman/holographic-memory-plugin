@@ -186,7 +186,7 @@ except ImportError:
     HAS_REQUESTS = False
 
 # ---------------------------------------------------------------------------
-# Schema (matches holographic memory store)
+# Schema (matches Mnemoss store)
 # ---------------------------------------------------------------------------
 
 _SCHEMA = """

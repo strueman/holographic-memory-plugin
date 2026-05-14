@@ -1,4 +1,4 @@
-"""Tests for sqlite-vec integration with holographic memory plugin."""
+"""Tests for sqlite-vec integration with Mnemoss."""
 
 import os
 import tempfile

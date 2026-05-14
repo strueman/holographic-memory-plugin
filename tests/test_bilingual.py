@@ -1,6 +1,6 @@
 """Bilingual (Chinese/English) search and entity extraction tests.
 
-Tests for the Chinese language support added to the holographic memory plugin:
+Tests for the Chinese language support added to Mnemoss:
 - Language detection (Chinese character regex)
 - Chinese tokenization (jieba + character-level fallback)
 - Chinese LIKE-based search (FTS5 fallback)

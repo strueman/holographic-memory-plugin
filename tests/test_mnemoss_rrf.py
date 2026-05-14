@@ -1,4 +1,4 @@
-"""Tests for Reciprocal Rank Fusion (RRF) in the holographic memory plugin.
+"""Tests for Reciprocal Rank Fusion (RRF) in the Mnemoss plugin.
 
 Tests verify that the RRF fusion logic:
 1. Produces correct rank-based scores for all retrieval methods
@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 class FakeHrrModule:
-    """Minimal mock of the holographic module for tests without numpy."""
+    """Minimal mock of the HRR module for tests without numpy."""
     _HAS_NUMPY = False
 
     @staticmethod
@@ -166,10 +166,10 @@ class TestRRFSearchIntegration:
 
     @pytest.fixture
     def retriever(self, store):
-        # Patch the holographic module to not require numpy
+        # Patch the HRR module to not require numpy
         with patch.dict(
             "sys.modules",
-            {"holographic.holographic": FakeHrrModule},
+            {"hrr.hrr": FakeHrrModule},
             clear=False,
         ):
             from retrieval import FactRetriever

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Setup for holographic-memory-plugin standalone testing."""
+"""Setup for Mnemoss standalone testing."""
 
 from setuptools import setup, find_packages
 
 setup(
-    name="holographic-memory-plugin",
-    version="0.4.6",
-    description="Holographic memory plugin for Hermes Agent — SQLite-backed fact storage with entity resolution, trust scoring, HRR vectors, and RRF retrieval.",
+    name="mnemoss",
+    version="0.4.10",
+    description="Mnemoss memory plugin for Hermes Agent — SQLite-backed fact storage with entity resolution, trust scoring, HRR vectors, and RRF retrieval.",
     author="Simon (strueman)",
     python_requires=">=3.11",
     packages=find_packages(),
