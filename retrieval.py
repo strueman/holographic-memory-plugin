@@ -1088,7 +1088,7 @@ class FactRetriever:
     }
 
     # Entity extraction regex (mirrors store._RE_CAPITALIZED to avoid circular imports)
-    _RE_CAPITALIZED = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+    _RE_CAPITALIZED = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b')
 
     def _extract_query_components(self, query: str) -> dict:
         """Decompose a query into coverable evidence components.

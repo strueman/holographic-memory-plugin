@@ -5,7 +5,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="mnemoss",
-    version="0.4.12",
+    version="0.4.13",
     description="Mnemoss memory plugin for Hermes Agent — SQLite-backed fact storage with entity resolution, trust scoring, HRR vectors, and RRF retrieval.",
     author="Simon (strueman)",
     python_requires=">=3.11",

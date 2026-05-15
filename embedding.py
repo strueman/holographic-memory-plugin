@@ -13,7 +13,6 @@ Hermes home directory.
 
 from __future__ import annotations
 
-import numpy as np
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,6 +21,7 @@ if TYPE_CHECKING:
     from tokenizers import Tokenizer
 
 # Lazy-loaded singletons
+_np = None
 _sess: InferenceSession | None = None
 _tok: Tokenizer | None = None
 _available: bool = False
@@ -58,12 +58,14 @@ def _download_file(url: str, dest: Path) -> bool:
 
 def _load() -> None:
     """Lazy-load the ONNX session and tokenizer. Idempotent."""
-    global _sess, _tok, _available
+    global _np, _sess, _tok, _available
 
     if _sess is not None:
         return  # Already loaded
 
     try:
+        import numpy as np  # noqa: F821
+        _np = np
         import onnxruntime as ort
         from tokenizers import Tokenizer as Tkz
 
@@ -97,7 +99,7 @@ def is_available() -> bool:
 _MAX_TOKENS = 512  # e5-small max position embeddings
 
 
-def encode(text: str, prefix: str = "passage") -> np.ndarray:
+def encode(text: str, prefix: str = "passage") -> np.ndarray:  # type: ignore[name-defined]
     """Encode a text string into a 384-dim L2-normalized embedding.
 
     Uses multilingual-e5-small's pre-pooled sentence embedding output.
@@ -113,7 +115,7 @@ def encode(text: str, prefix: str = "passage") -> np.ndarray:
     Returns None if the model is unavailable or encoding fails.
     """
     _load()
-    if not _available or _sess is None or _tok is None:
+    if not _available or _sess is None or _tok is None or _np is None:
         return None
 
     # e5 models require a prefix for proper embeddings
@@ -129,8 +131,8 @@ def encode(text: str, prefix: str = "passage") -> np.ndarray:
         return None
 
     # Teradata ONNX model expects 2D input (batch_size, seq_len), not 3D
-    input_ids = np.array([encoded.ids[:seq_len]], dtype=np.int64)
-    attention_mask = np.array([[1] * seq_len], dtype=np.int64)
+    input_ids = _np.array([encoded.ids[:seq_len]], dtype=_np.int64)
+    attention_mask = _np.array([[1] * seq_len], dtype=_np.int64)
 
     try:
         outputs = _sess.run(None, {
@@ -145,14 +147,14 @@ def encode(text: str, prefix: str = "passage") -> np.ndarray:
     sentence_emb = outputs[1]  # (1, 384)
 
     # L2 normalize
-    norm = np.linalg.norm(sentence_emb)
+    norm = _np.linalg.norm(sentence_emb)
     if norm > 0:
         sentence_emb = sentence_emb / norm
 
-    return sentence_emb[0].astype(np.float32)  # Return (384,) not (1, 384)
+    return sentence_emb[0].astype(_np.float32)  # Return (384,) not (1, 384)
 
 
-def encode_batch(texts: list[str]) -> list[np.ndarray | None]:
+def encode_batch(texts: list[str]) -> list[np.ndarray | None]:  # type: ignore[name-defined]
     """Encode multiple texts. Returns list of embeddings (None for failures)."""
     results = []
     for text in texts:
