@@ -140,13 +140,30 @@ _CONSOLIDATE_OBS_TRUST        = 0.7  # trust for generated observations
 _CONSOLIDATE_MAX_OBS_PER_ENTITY = 5  # max L1 observations per entity
 
 # Entity extraction patterns
-_RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+# Matches multi-word capitalized phrases AND single capitalized words
+# Single words are filtered against _ENTITY_STOP_WORDS to avoid false positives
+# from sentence-start capitalization
+_RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b')
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
 _RE_SINGLE_QUOTE = re.compile(r"'([^']+)'")
 _RE_AKA          = re.compile(
     r'(\w+(?:\s+\w+)*)\s+(?:aka|also known as)\s+(\w+(?:\s+\w+)*)',
     re.IGNORECASE,
 )
+
+# Single capitalized words that are common English sentence starters or
+# generic nouns — excluded from entity extraction to reduce noise
+_ENTITY_STOP_WORDS = {
+    "The", "A", "An", "I", "We", "They", "He", "She", "It", "This", "That",
+    "These", "Those", "What", "Where", "When", "Why", "How", "Who",
+    "Which", "There", "Here", "Just", "Only", "Also", "Then", "Now",
+    "After", "Before", "During", "If", "So", "But", "Or", "And",
+    "Not", "No", "Yes", "Can", "Will", "Would", "Could", "Should",
+    "May", "Might", "Must", "Shall", "Do", "Does", "Did", "Have",
+    "Has", "Had", "Is", "Are", "Was", "Were", "Be", "Been", "Being",
+    "All", "Each", "Every", "Both", "Few", "More", "Most", "Some",
+    "Such", "Own", "Same", "Other", "Another", "Any",
+}
 
 # Chinese character detection (CJK Unified Ideographs)
 _RE_CHINESE = re.compile(r'[\u4e00-\u9fff]')
@@ -728,7 +745,7 @@ class MemoryStore:
                         union = len(new_entities | other_entities)
                         if union > 0:
                             entity_jaccard = len(new_entities & other_entities) / union
-                            if entity_jaccard > _ENTITY_LINK_THRESHOLD:
+                            if entity_jaccard >= _ENTITY_LINK_THRESHOLD:
                                 links_to_create.append(
                                     (fact_id, other_id, "entity_overlap", round(entity_jaccard, 4))
                                 )
@@ -1230,10 +1247,14 @@ class MemoryStore:
         """Extract entity candidates from text using simple regex rules.
 
         Rules applied (in order):
-        1. Capitalized multi-word phrases  e.g. "John Doe"
+        1. Capitalized phrases (multi-word preferred, single-word filtered)
         2. Double-quoted terms             e.g. "Python"
         3. Single-quoted terms             e.g. 'pytest'
         4. AKA patterns                    e.g. "Guido aka BDFL" -> two entities
+
+        Single capitalized words are filtered against _ENTITY_STOP_WORDS to
+        avoid false positives from sentence-start capitalization (e.g., "The",
+        "This", "After"). Multi-word capitalized phrases are always kept.
 
         Returns a deduplicated list preserving first-seen order.
         """
@@ -1242,9 +1263,14 @@ class MemoryStore:
 
         def _add(name: str) -> None:
             stripped = name.strip()
-            if stripped and stripped.lower() not in seen:
-                seen.add(stripped.lower())
-                candidates.append(stripped)
+            if not stripped or stripped.lower() in seen:
+                return
+            # Filter single-word stop words (sentence starters, pronouns, etc.)
+            # Multi-word phrases are always kept
+            if ' ' not in stripped and stripped in _ENTITY_STOP_WORDS:
+                return
+            seen.add(stripped.lower())
+            candidates.append(stripped)
 
         for m in _RE_CAPITALIZED.finditer(text):
             _add(m.group(1))
