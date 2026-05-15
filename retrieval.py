@@ -946,6 +946,10 @@ class FactRetriever:
         making keyword search completely ineffective. This method uses
         LIKE-based pattern matching with jieba tokenization instead.
 
+        Uses OR semantics (match ANY token) and scores by number of tokens
+        matched, so multi-word queries return results even when no single fact
+        contains all query terms.
+
         Returns list of fact dicts with 'fts_rank' field (for RRF fusion).
         """
         conn = self.store._conn
@@ -955,37 +959,40 @@ class FactRetriever:
         if not tokens:
             return []
 
-        # Build LIKE query with AND semantics (must match all keywords)
-        like_clauses = []
+        # Build OR-based LIKE query (match ANY token)
+        or_clauses = []
         params: list = []
         for token in tokens:
-            like_clauses.append("(f.content LIKE ? OR f.tags LIKE ?)")
+            or_clauses.append("(f.content LIKE ? OR f.tags LIKE ?)")
             params.append(f"%{self._escape_like(token)}%")
             params.append(f"%{self._escape_like(token)}%")
 
-        where_clauses = like_clauses
-        where_clauses.append("f.trust_score >= ?")
+        # Base WHERE: match at least one token + trust threshold
+        or_sql = " OR ".join(or_clauses)
+        where_parts = [f"({or_sql})"]
+        where_parts.append("f.trust_score >= ?")
         params.append(min_trust)
 
         if category:
-            where_clauses.append("f.category = ?")
+            where_parts.append("f.category = ?")
             params.append(category)
 
         if episode_id is not None:
-            where_clauses.append("ef.episode_id = ?")
+            where_parts.append("ef.episode_id = ?")
             params.append(episode_id)
 
-        where_sql = " AND ".join(where_clauses)
+        where_sql = " AND ".join(where_parts)
         episode_join = "JOIN episode_facts ef ON ef.fact_id = f.fact_id" if episode_id is not None else ""
 
+        # Fetch more candidates to allow scoring/sorting
         sql = f"""
-            SELECT f.*, 0 as fts_rank_raw
+            SELECT f.*
             FROM facts f
             {episode_join}
             WHERE {where_sql}
             LIMIT ?
         """
-        params.append(limit * 3)
+        params.append(limit * 5)
 
         try:
             rows = conn.execute(sql, params).fetchall()
@@ -995,14 +1002,28 @@ class FactRetriever:
         if not rows:
             return []
 
-        results = []
-        for rank, row in enumerate(rows, start=1):
+        # Score each fact by number of query tokens matched
+        escaped_tokens = [self._escape_like(t) for t in tokens]
+        scored = []
+        for row in rows:
             fact = dict(row)
-            fact.pop("fts_rank_raw", None)
-            fact["fts_rank"] = rank  # Use rank order directly for Chinese LIKE
+            content = fact.get("content", "")
+            match_count = sum(
+                1 for t in escaped_tokens if t in content
+            )
+            fact["_match_count"] = match_count
+            scored.append(fact)
+
+        # Sort by match count descending (more matches = better rank)
+        scored.sort(key=lambda x: x["_match_count"], reverse=True)
+
+        results = []
+        for rank, fact in enumerate(scored, start=1):
+            fact.pop("_match_count", None)
+            fact["fts_rank"] = rank
             results.append(fact)
 
-        return results
+        return results[:limit * 3]
 
     def _fts_candidates_with_chinese_fallback(
         self,

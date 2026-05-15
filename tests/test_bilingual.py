@@ -247,6 +247,43 @@ class TestChineseSearch:
         assert len(results) >= 1
         assert any("编程" in r["content"] for r in results)
 
+    def test_chinese_multiword_query_returns_results(self):
+        """Multi-word Chinese query returns results (OR semantics).
+
+        Regression test: previously AND semantics required ALL tokens
+        to match a single fact, so multi-word queries returned 0.
+        """
+        mock_store = MockMemoryStore()
+        mock_store.add_fact("星云项目使用Transformer架构")
+        mock_store.add_fact("混合专家模型在GPU上运行")
+        mock_store.add_fact("GGUF量化部署模型")
+
+        retriever = FactRetriever(mock_store)
+        # Multi-word query: tokens span across different facts
+        results = retriever._chinese_candidates(
+            "星云项目Transformer架构混合专家", None, 0.3, 10
+        )
+        # Should return results (OR semantics)
+        assert len(results) >= 1
+        # Fact with more matches should rank higher
+        first = results[0]
+        assert "星云" in first["content"] or "Transformer" in first["content"]
+
+    def test_chinese_multiword_match_count_ranking(self):
+        """Facts matching more query tokens rank higher."""
+        mock_store = MockMemoryStore()
+        mock_store.add_fact("Python编程学习指南")  # matches: Python, 编程, 学习
+        mock_store.add_fact("Python入门教程")  # matches: Python
+        mock_store.add_fact("机器学习算法")  # matches: 学习
+
+        retriever = FactRetriever(mock_store)
+        results = retriever._chinese_candidates(
+            "Python编程学习", None, 0.3, 10
+        )
+        assert len(results) >= 2
+        # Fact with most matches should be ranked first
+        assert "Python编程学习指南" in results[0]["content"]
+
 
 # ============================================================
 # Test 4: Chinese Entity Extraction
