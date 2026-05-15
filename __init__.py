@@ -22,7 +22,7 @@ import logging
 import re
 from typing import Any, Dict, List
 
-__version__ = "0.4.13"
+__version__ = "0.4.14"
 
 # Graceful imports — these aren't available in the standalone test environment.
 # When running tests from the plugin repo, the hermes-agent internals don't exist.
