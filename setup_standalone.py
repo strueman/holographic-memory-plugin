@@ -11,6 +11,10 @@ if __name__ == "__main__":
         author="Simon (strueman)",
         python_requires=">=3.11",
         packages=find_packages(),
+        package_data={
+            "mnemoss": ["*.yaml", "*.yml"],
+        },
+        data_files=[(".", ["plugin.yaml", "cli.py"])],
         install_requires=[],  # stdlib-only core; optional deps in requirements.txt
         extras_require={
             "vec": ["sqlite-vec", "onnxruntime", "tokenizers"],

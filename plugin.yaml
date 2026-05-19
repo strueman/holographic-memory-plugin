@@ -1,0 +1,9 @@
+name: mnemoss
+version: 0.4.14
+description: "Structured fact storage with entity resolution, trust scoring, and 5-signal RRF retrieval."
+hooks:
+  - prefetch
+  - system_prompt_block
+  - on_session_end
+  - on_memory_write
+  - shutdown
