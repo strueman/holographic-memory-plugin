@@ -30,11 +30,36 @@ A lightweight memory system for [Hermes Agent](https://github.com/NousResearch/h
 
 ## Installation
 
-Drop the `mnemoss` directory into your Hermes Agent plugin path:
+**One-liner (recommended):**
 
 ```bash
-cp -r mnemoss ~/.hermes/hermes-agent/plugins/memory/mnemoss
+curl -fsSL https://raw.githubusercontent.com/strueman/mnemoss/main/install.sh | bash
 ```
+
+The interactive installer will:
+1. Confirm your Hermes Agent base path (default `~/.hermes/`)
+2. Detect existing profiles and ask which to install to
+3. Download and install the plugin files
+4. Guide you through the setup wizard
+
+**Manual install:**
+
+```bash
+# Clone the repo
+git clone https://github.com/strueman/mnemoss.git
+cd mnemoss
+
+# Copy plugin files to your Hermes Agent profile(s)
+# For the default profile:
+mkdir -p ~/.hermes/plugins/memory/mnemoss
+cp __init__.py store.py retrieval.py hrr.py embedding.py fact_splitter.py plugin.yaml cli.py ~/.hermes/plugins/memory/mnemoss/
+
+# For a specific profile:
+mkdir -p ~/.hermes/profiles/myprofile/plugins/memory/mnemoss
+cp __init__.py store.py retrieval.py hrr.py embedding.py fact_splitter.py plugin.yaml cli.py ~/.hermes/profiles/myprofile/plugins/memory/mnemoss/
+```
+
+**After installation:** Run `hermes mnemoss setup` to configure the plugin.
 
 ## Architecture
 
